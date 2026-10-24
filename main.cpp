@@ -5,8 +5,8 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <fcntl.h>
+#include <format>
 #include <iostream>
-#include <print>
 #include <stdexcept>
 #include <string>
 #include <sys/epoll.h>
@@ -19,163 +19,174 @@
 #define MAX_EVENTS 10
 
 std::string readUntil(int fd, char cEnd) {
-    char c = ' ';
-    std::string buffer;
-    while (c != cEnd) {
-        ssize_t chars_read = read(fd, &c, sizeof(char));
-        if (chars_read <= 0) {
-            throw std::runtime_error("Failed to read from socket");
-        }
-        if (c != cEnd) {
-            buffer += c;
-        }
+  char c = ' ';
+  std::string buffer;
+  while (c != cEnd) {
+    ssize_t chars_read = read(fd, &c, sizeof(char));
+    if (chars_read <= 0) {
+      throw std::runtime_error("Failed to read from socket");
     }
-    return buffer;
+    if (c != cEnd) {
+      buffer += c;
+    }
+  }
+  return buffer;
 }
-
 
 class FileDescriptor {
 public:
-    FileDescriptor() = default;
+  FileDescriptor() = default;
 
-    explicit FileDescriptor(int fd) : m_fd(fd) {}
+  explicit FileDescriptor(int fd) : m_fd(fd) {}
 
-    ~FileDescriptor() {
-        if (m_fd >= 0)
-            ::close(m_fd);
+  ~FileDescriptor() {
+    if (m_fd >= 0)
+      ::close(m_fd);
+  }
+
+  FileDescriptor(const FileDescriptor &) = delete;
+
+  FileDescriptor &operator=(const FileDescriptor &) = delete;
+
+  FileDescriptor(FileDescriptor &&o) noexcept
+      : m_fd(std::exchange(o.m_fd, -1)) {}
+
+  FileDescriptor &operator=(FileDescriptor &&o) noexcept {
+    if (this != &o) {
+      if (m_fd >= 0)
+        ::close(m_fd);
+      m_fd = std::exchange(o.m_fd, -1);
     }
+    return *this;
+  }
 
-    FileDescriptor(const FileDescriptor &) = delete;
-    FileDescriptor &operator=(const FileDescriptor &) = delete;
-
-    FileDescriptor(FileDescriptor &&o) noexcept : m_fd(std::exchange(o.m_fd, -1)) {}
-
-    FileDescriptor &operator=(FileDescriptor &&o) noexcept {
-        if (this != &o) {
-            if (m_fd >= 0)
-                ::close(m_fd);
-            m_fd = std::exchange(o.m_fd, -1);
-        }
-        return *this;
-    }
-
-    [[nodiscard]] int get() const { return m_fd; }
+  [[nodiscard]] int get() const { return m_fd; }
 
 private:
-    int m_fd = -1;
+  int m_fd = -1;
 };
 
 class Server {
 public:
-    Server(std::string ip, int port) : m_ip(std::move(ip)), m_port(port) {}
+  Server(std::string ip, int port) : m_ip(std::move(ip)), m_port(port) {}
 
-    void listen() {
-        struct sockaddr_in s_addr{};
+  void start() {
+    struct sockaddr_in s_addr{};
 
-        int temp_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (temp_socket < 0) {
-            throw std::runtime_error("Failed to create socket");
-        }
-
-        m_socket = FileDescriptor(temp_socket);
-
-        memset(&s_addr, 0, sizeof(s_addr));
-        s_addr.sin_family = AF_INET;
-        s_addr.sin_port = htons(m_port);
-
-        // s_addr.sin_addr.s_addr = INADDR_ANY;
-        if (inet_pton(AF_INET, m_ip.c_str(), &s_addr.sin_addr) < 0) {
-            throw std::runtime_error("Invalid IP address");
-        }
-        if (bind(m_socket.get(), reinterpret_cast<sockaddr *>(&s_addr), sizeof(s_addr)) < 0) {
-            throw std::runtime_error("Failed to bind socket");
-        }
-
-        ::listen(m_socket.get(), MAX_CONNECTIONS);
+    int temp_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (temp_socket < 0) {
+      throw std::runtime_error("Failed to create socket");
     }
 
-    const FileDescriptor& accept() {
-        if (m_clients.size() == MAX_CONNECTIONS) {
-            throw std::runtime_error("Too many clients");
-        }
+    m_socket = FileDescriptor(temp_socket);
 
-        const int fd_temp = ::accept(m_socket.get(), nullptr, nullptr);
+    memset(&s_addr, 0, sizeof(s_addr));
+    s_addr.sin_family = AF_INET;
+    s_addr.sin_port = htons(m_port);
 
-        if (fd_temp < 0) {
-            throw std::runtime_error("Failed to accept connection");
-        }
-
-        std::println("Connection accepted: {}", std::to_string(fd_temp));
-
-        m_clients.emplace_back(fd_temp);
-        return m_clients.back();
+    // s_addr.sin_addr.s_addr = INADDR_ANY;
+    if (inet_pton(AF_INET, m_ip.c_str(), &s_addr.sin_addr) < 0) {
+      throw std::runtime_error("Invalid IP address");
+    }
+    if (bind(m_socket.get(), reinterpret_cast<sockaddr *>(&s_addr),
+             sizeof(s_addr)) < 0) {
+      throw std::runtime_error("Failed to bind socket");
     }
 
-    [[nodiscard]] std::string ReadMessage() const { return readUntil(m_clients.front().get(), '\n'); }
+    ::listen(m_socket.get(), MAX_CONNECTIONS);
+  }
 
-    [[nodiscard]] std::string getIp() const { return m_ip; }
+  const FileDescriptor &accept() {
+    if (m_clients.size() == MAX_CONNECTIONS) {
+      throw std::runtime_error("Too many clients");
+    }
 
-    [[nodiscard]] int getPort() const { return m_port; }
+    const int fd_temp = ::accept(m_socket.get(), nullptr, nullptr);
 
-    [[nodiscard]] const FileDescriptor &getClient(int pos) const { return m_clients[pos]; }
+    if (fd_temp < 0) {
+      throw std::runtime_error("Failed to accept connection");
+    }
 
-    [[nodiscard]] const FileDescriptor &get() const { return m_socket; }
+    std::cout << std::format("Connection accepted: {}", std::to_string(fd_temp)) << std::endl;
 
-    [[nodiscard]] const int getUnderlying() const { return m_socket.get(); }
+    m_clients.emplace_back(fd_temp);
+    return m_clients.back();
+  }
+
+  [[nodiscard]] std::string ReadMessage() const {
+    return readUntil(m_clients.front().get(), '\n');
+  }
+
+  [[nodiscard]] std::string getIp() const { return m_ip; }
+
+  [[nodiscard]] int getPort() const { return m_port; }
+
+  [[nodiscard]] const FileDescriptor &get() const { return m_socket; }
+
+  [[nodiscard]] int getUnderlying() const { return m_socket.get(); }
 
 private:
-    FileDescriptor m_socket;
-    std::string m_ip;
-    std::vector<FileDescriptor> m_clients;
-    int m_port;
+  FileDescriptor m_socket;
+  std::string m_ip;
+  std::vector<FileDescriptor> m_clients;
+  int m_port;
 };
 
-void do_use_fd(int fd) { std::println("Message received: {}", readUntil(fd, '\n')); }
+void do_use_fd(int fd)
+{
+  std::cout << std::format("Message received: {}", readUntil(fd, '\n')) << std::endl;
+}
 
-int main() {
-    Server server("0.0.0.0", 8080);
-    FileDescriptor epoll_fd(epoll_create1(0));
-    struct epoll_event event;
-    struct epoll_event events[1];
+int main()
+{
+  Server server("0.0.0.0", 8080);
+  FileDescriptor epoll_fd(epoll_create1(0));
+  struct epoll_event event;
+  struct epoll_event events[MAX_EVENTS];
 
-    try {
-        server.listen();
-    } catch (const std::exception &e) {
-        // Handle exception
-        std::println("{}", e.what());
-        return EXIT_FAILURE;
+  try {
+    server.start();
+  } catch (const std::exception &e) {
+    // Handle exception
+    std::cout << std::format("{}", e.what()) << std::endl;
+    return EXIT_FAILURE;
+  }
+  std::cout << std::format("Server is listening on port {}...", server.getPort()) << std::endl;
+
+  event.events = EPOLLIN;
+  event.data.fd = server.getUnderlying();
+
+  // add server to epoll
+  epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, server.getUnderlying(), &event);
+
+  for (;;) {
+    int nfds = epoll_wait(epoll_fd.get(), events, MAX_EVENTS, -1);
+    if (nfds == -1) {
+      perror("epoll_wait");
+      exit(EXIT_FAILURE);
     }
-    std::println("Server is listening on port {}...", server.getPort());
 
+    for (int n = 0; n < nfds; ++n) {
+      if (events[n].data.fd == server.getUnderlying()) {
+        const FileDescriptor &client_fd = server.accept();
 
-    event.events = EPOLLIN;
-    event.data.fd = server.getUnderlying();
-
-    // add server to epoll
-    epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, server.getUnderlying(), &event);
-
-    for (;;) {
-        int nfds = epoll_wait(epoll_fd.get(), events, MAX_EVENTS, -1);
-        if (nfds == -1) {
-            perror("epoll_wait");
-            exit(EXIT_FAILURE);
+        if (client_fd.get() < 0) {
+          perror("accept");
+          return EXIT_FAILURE;
         }
 
-        for (int n = 0; n < nfds; ++n) {
-            if (events[n].data.fd == server.getUnderlying()){
-                const FileDescriptor &client_fd = server.accept();
-
-                // setnonblocking(server.getClient(0).get());
-                event.events = EPOLLIN | EPOLLET;
-                event.data.fd = client_fd.get();
-                if (epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, client_fd.get(), &event) == -1) {
-                    perror("epoll_ctl: conn_sock");
-                    return EXIT_FAILURE;
-                }
-            } else {
-                do_use_fd(events[n].data.fd);
-            }
+        // setnonblocking(server.getClient(0).get());
+        event.events = EPOLLIN | EPOLLET;
+        event.data.fd = client_fd.get();
+        if (epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, client_fd.get(), &event) ==
+            -1) {
+          perror("epoll_ctl: conn_sock");
+          return EXIT_FAILURE;
         }
+      } else {
+        do_use_fd(events[n].data.fd);
+      }
     }
-    return EXIT_SUCCESS;
+  }
+  return EXIT_SUCCESS;
 }
