@@ -26,8 +26,8 @@ int main(int argc, char **argv)
     sigemptyset(&sa.sa_mask);
     sa.sa_handler = quitProgram;
     sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN);
+    sigaction(SIGINT, &sa, nullptr);
+    std::signal(SIGPIPE, SIG_IGN);
 
     ip = argv[1];
     port = atoi(argv[2]);
