@@ -8,26 +8,35 @@
 #include <unistd.h>
 #include <utility>
 
-class FileDescriptor {
+class FileDescriptor
+{
 public:
     FileDescriptor() = default;
 
-    explicit FileDescriptor(int fd) : m_fd(fd) {}
+    explicit FileDescriptor(int fd) : m_fd(fd)
+    {
+    }
 
-    ~FileDescriptor() {
+    ~FileDescriptor()
+    {
         if (m_fd >= 0)
             ::close(m_fd);
     }
 
-    FileDescriptor(const FileDescriptor &) = delete;
+    FileDescriptor(const FileDescriptor&) = delete;
 
-    FileDescriptor &operator=(const FileDescriptor &) = delete;
+    FileDescriptor& operator=(const FileDescriptor&) = delete;
 
-    FileDescriptor(FileDescriptor &&o) noexcept
-        : m_fd(std::exchange(o.m_fd, -1)) {}
+    FileDescriptor(FileDescriptor&& o) noexcept
+        : m_fd(std::exchange(o.m_fd, -1))
+    {
+    }
 
-    FileDescriptor &operator=(FileDescriptor &&o) noexcept {
-        if (this != &o) {
+
+    FileDescriptor& operator=(FileDescriptor&& o) noexcept
+    {
+        if (this != &o)
+        {
             if (m_fd >= 0)
                 ::close(m_fd);
             m_fd = std::exchange(o.m_fd, -1);

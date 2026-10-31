@@ -7,19 +7,18 @@
 #include <fcntl.h>
 #include <format>
 #include <iostream>
-#include <stdexcept>
 #include <string>
 #include <sys/epoll.h>
 #include <unordered_map>
 
-#include "FileDescriptor.h"
-#include "Server.h"
+#include <common/FileDescriptor.h>
+#include <server/Server.h>
 
 int main()
 {
     Server server("0.0.0.0", 8080);
     FileDescriptor epoll_fd(epoll_create1(0));
-    struct epoll_event event;
+    struct epoll_event event{};
     struct epoll_event events[MAX_EVENTS];
 
     try
@@ -43,7 +42,7 @@ int main()
     // buffers map
     std::unordered_map<int, std::string> buffers;
 
-    for (;;)
+    while (true)
     {
         int nfds = epoll_wait(epoll_fd.get(), events, MAX_EVENTS, -1);
         if (nfds == -1)
@@ -76,7 +75,8 @@ int main()
             {
                 int fd = events[n].data.fd;
                 auto &buf = buffers[fd];
-                char tmp[4096];
+                char tmp[1028];
+                bool closed = false;
                 for (;;)
                 {
                     const ssize_t r = read(fd, tmp, sizeof(tmp));
@@ -87,19 +87,24 @@ int main()
                     }
                     if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
                     {
-                        epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL, fd, nullptr);
-                        buffers.erase(fd);
-                        server.close(fd); // destroy the fd
-                        goto next;
+                        closed = true; // still deliver what was buffered before the peer hung up
                     }
-                    break; // EAGAIN: drained
+                    break; // closed, or EAGAIN: drained
                 }
-                for (size_t pos; (pos = buf.find('\n')) != std::string::npos;)
+                for (size_t pos; (pos = buf.find('\0')) != std::string::npos;)
                 {
-                    std::cout << std::format("Message received: {}", buf.substr(0, pos)) << std::endl;
+                    if (pos > 0) // zero padding of the fixed-size frame yields empty messages
+                    {
+                        std::cout << std::format("Message received: {}", buf.substr(0, pos)) << std::endl;
+                    }
                     buf.erase(0, pos + 1);
                 }
-            next:;
+                if (closed)
+                {
+                    epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL, fd, nullptr);
+                    buffers.erase(fd);
+                    server.close(fd); // destroy the fd
+                }
             }
         }
     }

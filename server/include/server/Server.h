@@ -8,18 +8,18 @@
 #define MAX_CONNECTIONS 10
 #define MAX_EVENTS 10
 
+#include <arpa/inet.h>
 #include <cstring>
 #include <format>
 #include <iostream>
+#include <netinet/in.h>
 #include <stdexcept>
 #include <string>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #include <vector>
 
-#include "FileDescriptor.h"
+#include <common/FileDescriptor.h>
 
 inline std::string readUntil(int fd, char cEnd)
 {
@@ -44,9 +44,9 @@ inline std::string readUntil(int fd, char cEnd)
 class Server
 {
 public:
-    Server(std::string ip, int port) : m_ip(std::move(ip)), m_port(port)
-    {
-    }
+    Server(std::string ip, int port) : m_ip(std::move(ip)), m_port(port) {}
+    Server(const Server &) = delete;
+    Server &operator=(const Server &) = delete;
 
     void start()
     {
@@ -69,8 +69,7 @@ public:
         {
             throw std::runtime_error("Invalid IP address");
         }
-        if (bind(m_socket.get(), reinterpret_cast<sockaddr*>(&s_addr),
-                 sizeof(s_addr)) < 0)
+        if (bind(m_socket.get(), reinterpret_cast<sockaddr *>(&s_addr), sizeof(s_addr)) < 0)
         {
             throw std::runtime_error("Failed to bind socket");
         }
@@ -78,7 +77,7 @@ public:
         ::listen(m_socket.get(), MAX_CONNECTIONS);
     }
 
-    const FileDescriptor& accept()
+    const FileDescriptor &accept()
     {
         if (m_clients.size() == MAX_CONNECTIONS)
         {
@@ -98,17 +97,12 @@ public:
         return m_clients.back();
     }
 
-    [[nodiscard]] std::string ReadMessage() const
-    {
-        return readUntil(m_clients.front().get(), '\n');
-    }
+    [[nodiscard]] std::string ReadMessage() const { return readUntil(m_clients.front().get(), '\n'); }
 
     void close(int fd)
     {
-        auto it = std::remove_if(m_clients.begin(), m_clients.end(), [fd](FileDescriptor& client)
-        {
-            return client.get() == fd;
-        });
+        auto it = std::remove_if(m_clients.begin(), m_clients.end(),
+                                 [fd](FileDescriptor &client) { return client.get() == fd; });
 
         m_clients.erase(it, m_clients.end());
     }
@@ -117,7 +111,7 @@ public:
 
     [[nodiscard]] int getPort() const { return m_port; }
 
-    [[nodiscard]] const FileDescriptor& get() const { return m_socket; }
+    [[nodiscard]] const FileDescriptor &get() const { return m_socket; }
 
     [[nodiscard]] int getUnderlying() const { return m_socket.get(); }
 
@@ -129,4 +123,4 @@ private:
 };
 
 
-#endif //SERVER_SERVER_H
+#endif // SERVER_SERVER_H
