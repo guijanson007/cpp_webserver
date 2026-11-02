@@ -7,12 +7,15 @@
 #include <fcntl.h>
 #include <format>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <sys/epoll.h>
 #include <unordered_map>
 
 #include <common/FileDescriptor.h>
 #include <server/Server.h>
+
+static constexpr int MAX_EVENTS{10};
 
 int main()
 {
@@ -37,7 +40,11 @@ int main()
     event.data.fd = server.getUnderlying();
 
     // add server to epoll
-    epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, server.getUnderlying(), &event);
+    if (-1 == epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, server.getUnderlying(), &event))
+    {
+        perror("epoll_ctl: server_fd");
+        return EXIT_FAILURE;
+    }
 
     // buffers map
     std::unordered_map<int, std::string> buffers;
@@ -48,27 +55,30 @@ int main()
         if (nfds == -1)
         {
             perror("epoll_wait");
-            exit(EXIT_FAILURE);
+            return EXIT_FAILURE;
         }
 
         for (int n = 0; n < nfds; ++n)
         {
             if (events[n].data.fd == server.getUnderlying())
             {
-                const FileDescriptor &client_fd = server.accept();
 
-                if (client_fd.get() < 0)
+                while (std::optional<int> opt_fd = server.accept())
                 {
-                    perror("accept");
-                    return EXIT_FAILURE;
-                }
+                    if (opt_fd.value() == -1)
+                    {
+                        continue; // reach max connections, rejected new connection
+                    }
 
-                event.events = EPOLLIN | EPOLLET;
-                event.data.fd = client_fd.get();
-                if (epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, client_fd.get(), &event) == -1)
-                {
-                    perror("epoll_ctl: conn_sock");
-                    return EXIT_FAILURE;
+                    int client_fd = opt_fd.value();
+                    event.events = EPOLLIN | EPOLLET;
+                    event.data.fd = client_fd;
+                    if (-1 == epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, client_fd, &event))
+                    {
+                        std::cout << std::format("Failed to add client socket {} to epoll", client_fd) << std::endl;
+                        close(client_fd);
+                        continue;
+                    }
                 }
             }
             else
@@ -101,9 +111,12 @@ int main()
                 }
                 if (closed)
                 {
-                    epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL, fd, nullptr);
+                    if (-1 == epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL, fd, nullptr))
+                    {
+                        std::cout << std::format("Failed to remove client socket {} from epoll", fd) << std::endl;
+                    }
                     buffers.erase(fd);
-                    server.close(fd); // destroy the fd
+                    server.closeClientConnection(fd); // destroy the fd
                 }
             }
         }

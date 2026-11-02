@@ -5,14 +5,15 @@
 #ifndef SERVER_SERVER_H
 #define SERVER_SERVER_H
 
-#define MAX_CONNECTIONS 10
-#define MAX_EVENTS 10
 
+#include <algorithm>
 #include <arpa/inet.h>
+#include <cerrno>
 #include <cstring>
 #include <format>
 #include <iostream>
 #include <netinet/in.h>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
@@ -21,30 +22,11 @@
 
 #include <common/FileDescriptor.h>
 
-inline std::string readUntil(int fd, char cEnd)
-{
-    char c = ' ';
-    std::string buffer;
-    while (c != cEnd)
-    {
-        ssize_t chars_read = read(fd, &c, sizeof(char));
-        if (chars_read <= 0)
-        {
-            throw std::runtime_error("Failed to read from socket");
-        }
-        if (c != cEnd)
-        {
-            buffer += c;
-        }
-    }
-    return buffer;
-}
-
 
 class Server
 {
 public:
-    Server(std::string ip, int port) : m_ip(std::move(ip)), m_port(port) {}
+    Server(std::string ip, int port) : m_ip(std::move(ip)), m_port(port) { m_clients.reserve(MAX_CONNECTIONS); }
     Server(const Server &) = delete;
     Server &operator=(const Server &) = delete;
 
@@ -52,7 +34,7 @@ public:
     {
         struct sockaddr_in s_addr{};
 
-        int temp_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        int temp_socket = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
         if (temp_socket < 0)
         {
             throw std::runtime_error("Failed to create socket");
@@ -62,44 +44,64 @@ public:
 
         std::memset(&s_addr, 0, sizeof(s_addr));
         s_addr.sin_family = AF_INET;
-        s_addr.sin_port = htons(m_port);
+        s_addr.sin_port = ::htons(m_port);
 
         // s_addr.sin_addr.s_addr = INADDR_ANY;
-        if (inet_pton(AF_INET, m_ip.c_str(), &s_addr.sin_addr) < 0)
+        if (1 != ::inet_pton(AF_INET, m_ip.c_str(), &s_addr.sin_addr))
         {
             throw std::runtime_error("Invalid IP address");
         }
-        if (bind(m_socket.get(), reinterpret_cast<sockaddr *>(&s_addr), sizeof(s_addr)) < 0)
+        if (0 > ::bind(m_socket.get(), reinterpret_cast<sockaddr *>(&s_addr), sizeof(s_addr)))
         {
             throw std::runtime_error("Failed to bind socket");
         }
 
-        ::listen(m_socket.get(), MAX_CONNECTIONS);
+        if (0 > ::listen(m_socket.get(), MAX_CONNECTIONS))
+        {
+            throw std::runtime_error("Failed to listen on socket");
+        }
     }
 
-    const FileDescriptor &accept()
+    std::optional<int> accept()
     {
-        if (m_clients.size() == MAX_CONNECTIONS)
-        {
-            throw std::runtime_error("Too many clients");
-        }
+        int fd_temp{};
 
-        const int fd_temp = ::accept4(m_socket.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
-
-        if (fd_temp < 0)
+        while (true)
         {
-            throw std::runtime_error("Failed to accept connection");
+            fd_temp = ::accept4(m_socket.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if (fd_temp < 0)
+            {
+                if (errno == EINTR)
+                {
+                    // retry
+                    continue;
+                }
+
+                if (errno != EAGAIN)
+                {
+                    std::cout << std::format("Failed to accept connection: {}", std::strerror(errno)) << std::endl;
+                }
+                return std::nullopt;
+            }
+            break;
         }
 
         std::cout << std::format("Connection accepted: {}", std::to_string(fd_temp)) << std::endl;
 
+        if (m_clients.size() == MAX_CONNECTIONS)
+        {
+            std::cout << "Max connections reached. Closing the new connection." << std::endl;
+            ::close(fd_temp);
+            return {-1}; // Return -1 to indicate that the connection was closed due to max connections reached
+        }
+
+
         m_clients.emplace_back(fd_temp);
-        return m_clients.back();
+        return {m_clients.back().get()};
     }
 
-    [[nodiscard]] std::string ReadMessage() const { return readUntil(m_clients.front().get(), '\n'); }
 
-    void close(int fd)
+    void closeClientConnection(int fd)
     {
         auto it = std::remove_if(m_clients.begin(), m_clients.end(),
                                  [fd](FileDescriptor &client) { return client.get() == fd; });
@@ -116,6 +118,7 @@ public:
     [[nodiscard]] int getUnderlying() const { return m_socket.get(); }
 
 private:
+    static constexpr int MAX_CONNECTIONS{10};
     FileDescriptor m_socket;
     std::string m_ip;
     std::vector<FileDescriptor> m_clients;
