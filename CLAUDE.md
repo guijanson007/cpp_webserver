@@ -95,8 +95,40 @@ tests/             GoogleTest
 docs/              PERFORMANCE.md, architecture notes
 ```
 
-Current code is flatter (`server/include/server/Server.h`, `server/src/main.cpp`);
-reorganise during M1/M2.
+Current code is flatter; reorganise during M1/M2. Actual files today:
+
+```
+common/include/common/FileDescriptor.h   RAII, move-only fd
+server/include/network/EpollReactor.h    epoll fd + fd -> handler table + run()
+server/include/network/Connection.h      client fd + read buffer
+server/include/server/Server.h           listener, accept loop, client table, clientCallback
+server/src/main.cpp                      wiring only
+scripts/check_connection_limit.sh        WEB-1 check
+scripts/check_reactor.sh                 WEB-2 check (strace double close, SIGSTOP/SIGCONT)
+docs/tickets/WEB-<n>.md                  tickets from /next_task
+```
+
+## Current architecture (after WEB-2)
+
+- `EpollReactor` is a dumb dispatcher: `add(fd, events, handler)`, `modify`, `remove`,
+  `run()` (one `epoll_wait` pass, returns false on fatal error). Handlers are
+  `std::function<void(int fd)>`. `run()` copies the handler before calling it, so a
+  handler may `remove()` itself. It knows nothing about sockets or protocols.
+- `Server` owns the listening socket and `unordered_map<int, Connection>`. The listener
+  is level-triggered; clients are `EPOLLIN | EPOLLET` and are drained until `EAGAIN`.
+  `accept()` loops until `EAGAIN`, sheds connections over the cap with `continue`.
+- `Connection` owns its `FileDescriptor` and read buffer. Closing = `reactor.remove(fd)`
+  then erase from the map (the destructor closes the fd; never call raw `close` on an
+  fd a `Connection` owns).
+- `main` constructs reactor then server, `server.start()`, `while (reactor.run())`.
+- Event arrays are owned by the reactor (`MAX_EVENTS` constexpr member).
+
+## Workflow conventions
+
+- Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
+  WEB-2 (done, committed). Next is WEB-3 (write path + `EPOLLOUT`).
+- Verification scripts live in `scripts/`. `strace` is not installed on the dev machine
+  yet (`sudo dnf install strace`), so the strace parts of `check_reactor.sh` were never run.
 
 ## Build
 
@@ -107,19 +139,29 @@ cmake --build build
 
 Needs CMake >= 4.3. Formatting: `.clang-format` in repo root.
 
-## Known issues (M1 backlog, found in initial review)
+## Known issues (M1 backlog)
 
-- `Server::accept()` throws "Too many clients" when at the cap and nothing catches
-  it, so the process dies. `MAX_CONNECTIONS` (10) is far too low for the 10k goal.
-- `MAX_CONNECTIONS` / `MAX_EVENTS` are `#define` macros; use `constexpr`.
-- `<algorithm>` not included for `std::remove_if` in `Server::close`.
-- `readUntil` / `ReadMessage` are dead code and block on non-blocking sockets.
-- `inet_pton` returns 0 for a malformed address, but the check is `< 0`.
-- `listen`, `epoll_create1`, `epoll_ctl` results are unchecked.
-- Listener accepts only one connection per wakeup; loop until `EAGAIN`.
-- Server, epoll, and buffers are all mixed together in `main`.
-- No write path (no response buffering, no `EPOLLOUT`).
+Fixed (WEB-1, WEB-2): accept crash at the cap, `#define` macros, `<algorithm>`, dead
+`readUntil`/`ReadMessage`, `inet_pton` check, `listen`/`epoll_create1`/`epoll_ctl`
+checks, one-accept-per-wakeup, epoll mixed into `main`, double close on failed epoll
+registration, `EINTR` in `epoll_wait`.
+
+Open:
+
+- No write path (no output buffer, no `EPOLLOUT`). This is WEB-3.
+- `MAX_CONNECTIONS` (10) is far too low for the 10k goal and doubles as the `listen`
+  backlog. Make the limit configurable and give the backlog its own (large) setting.
+  The backlog is the kernel accept queue, not a concurrent-client cap.
+- `SO_REUSEADDR` in `Server::start()` passes the fd number (`&temp_socket`) as the
+  option value; works by accident. Use a named `int opt = 1` and check the result.
+- `modify()` / `remove()` return `int`, `add()` returns `bool`: make consistent.
+- Handler signature is `void(int fd)` and ignores `events`; WEB-3 needs the events
+  (`EPOLLOUT`, `EPOLLERR`, `EPOLLHUP`), so change it to carry `uint32_t events`.
+- Leftover/missing includes in `EpollReactor.h` / `Server.h`; unused `getFd()`.
+- Over-limit shedding uses raw `::close`; fd I/O still calls raw `read` in
+  `Server::clientCallback` (move behind the wrapper layer).
 - Wire protocol (NUL-padded frames) disappears once HTTP lands.
+- `check_reactor.sh` strace checks (double close, attach/detach) not yet run.
 
 ## Interview talking points (prepare per milestone)
 
