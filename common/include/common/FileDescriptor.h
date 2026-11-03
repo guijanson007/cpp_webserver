@@ -13,9 +13,7 @@ class FileDescriptor
 public:
     FileDescriptor() = default;
 
-    explicit FileDescriptor(int fd) : m_fd(fd)
-    {
-    }
+    explicit FileDescriptor(int fd) : m_fd(fd) {}
 
     ~FileDescriptor()
     {
@@ -23,17 +21,13 @@ public:
             ::close(m_fd);
     }
 
-    FileDescriptor(const FileDescriptor&) = delete;
+    FileDescriptor(const FileDescriptor &) = delete;
 
-    FileDescriptor& operator=(const FileDescriptor&) = delete;
+    FileDescriptor &operator=(const FileDescriptor &) = delete;
 
-    FileDescriptor(FileDescriptor&& o) noexcept
-        : m_fd(std::exchange(o.m_fd, -1))
-    {
-    }
+    FileDescriptor(FileDescriptor &&o) noexcept : m_fd(std::exchange(o.m_fd, -1)) {}
 
-
-    FileDescriptor& operator=(FileDescriptor&& o) noexcept
+    FileDescriptor &operator=(FileDescriptor &&o) noexcept
     {
         if (this != &o)
         {
@@ -51,4 +45,4 @@ private:
 };
 
 
-#endif //SERVER_FILEDESCRIPTOR_H
+#endif // SERVER_FILEDESCRIPTOR_H

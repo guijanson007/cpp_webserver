@@ -13,20 +13,23 @@
 #include <format>
 #include <iostream>
 #include <netinet/in.h>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <vector>
 
 #include <common/FileDescriptor.h>
-
+#include "network/Connection.h"
+#include "network/EpollReactor.h"
 
 class Server
 {
 public:
-    Server(std::string ip, int port) : m_ip(std::move(ip)), m_port(port) { m_clients.reserve(MAX_CONNECTIONS); }
+    Server(std::string ip, int port, network::EpollReactor &reactor)
+        : m_ip(std::move(ip)), m_port(port), m_reactor(reactor)
+    {
+        m_clients.reserve(MAX_CONNECTIONS);
+    }
     Server(const Server &) = delete;
     Server &operator=(const Server &) = delete;
 
@@ -51,18 +54,32 @@ public:
         {
             throw std::runtime_error("Invalid IP address");
         }
+        int opt = 1;
+        // set socket options to allow address reuse
+        if (0 > ::setsockopt(m_socket.get(), SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)))
+        {
+            throw std::runtime_error("Failed to set socket options");
+        }
+
         if (0 > ::bind(m_socket.get(), reinterpret_cast<sockaddr *>(&s_addr), sizeof(s_addr)))
         {
             throw std::runtime_error("Failed to bind socket");
         }
 
-        if (0 > ::listen(m_socket.get(), MAX_CONNECTIONS))
+        // backlog size is set to 1000 times the max connections
+        if (0 > ::listen(m_socket.get(), MAX_CONNECTIONS * 1000))
         {
             throw std::runtime_error("Failed to listen on socket");
         }
+
+        // register the server socket with the epoll reactor
+        if (!m_reactor.add(m_socket.get(), EPOLLIN, [this](int fd) { this->accept(); }))
+        {
+            throw std::runtime_error("Failed to add server socket to epoll reactor");
+        }
     }
 
-    std::optional<int> accept()
+    void accept()
     {
         int fd_temp{};
 
@@ -71,58 +88,107 @@ public:
             fd_temp = ::accept4(m_socket.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (fd_temp < 0)
             {
-                if (errno == EINTR)
+                if (errno == EAGAIN)
                 {
-                    // retry
-                    continue;
+                    return; // no more connections to accept
                 }
 
-                if (errno != EAGAIN)
+                if (errno != EINTR)
                 {
                     std::cout << std::format("Failed to accept connection: {}", std::strerror(errno)) << std::endl;
+                    return;
                 }
-                return std::nullopt;
+                else
+                {
+                    // retry if interrupted by signal
+                    continue;
+                }
             }
-            break;
+            else // successfully accepted a new connection
+            {
+                if (m_clients.size() == MAX_CONNECTIONS)
+                {
+                    std::cout << "Max connections reached. Closing the new connection." << std::endl;
+                    ::close(fd_temp);
+                    continue; // keep draining the accept queue
+                }
+
+                network::Connection new_client(fd_temp);
+                if (!m_reactor.add(fd_temp, EPOLLIN | EPOLLET, [this](int fd) { this->clientCallback(fd); }))
+                {
+                    return; // let the client socket be closed by the destructor of new_client
+                }
+                std::cout << std::format("Connection accepted: {}", std::to_string(fd_temp)) << std::endl;
+                m_clients.insert({fd_temp, std::move(new_client)});
+            }
         }
-
-        std::cout << std::format("Connection accepted: {}", std::to_string(fd_temp)) << std::endl;
-
-        if (m_clients.size() == MAX_CONNECTIONS)
-        {
-            std::cout << "Max connections reached. Closing the new connection." << std::endl;
-            ::close(fd_temp);
-            return {-1}; // Return -1 to indicate that the connection was closed due to max connections reached
-        }
-
-
-        m_clients.emplace_back(fd_temp);
-        return {m_clients.back().get()};
     }
 
 
-    void closeClientConnection(int fd)
-    {
-        auto it = std::remove_if(m_clients.begin(), m_clients.end(),
-                                 [fd](FileDescriptor &client) { return client.get() == fd; });
-
-        m_clients.erase(it, m_clients.end());
-    }
+    void closeClientConnection(int fd) { m_clients.erase(fd); }
 
     [[nodiscard]] std::string getIp() const { return m_ip; }
 
     [[nodiscard]] int getPort() const { return m_port; }
 
-    [[nodiscard]] const FileDescriptor &get() const { return m_socket; }
+    [[nodiscard]] int get() const { return m_socket.get(); }
 
-    [[nodiscard]] int getUnderlying() const { return m_socket.get(); }
+private:
+    void clientCallback(int client_fd)
+    {
+        auto client_it = m_clients.find(client_fd);
+
+        if (client_it == m_clients.end())
+        {
+            std::cout << std::format("Client with fd {} not found", client_fd) << std::endl;
+            return;
+        }
+        auto &client = client_it->second;
+
+        auto &buf = client.getReadBuffer();
+        char tmp[1028];
+        bool closed = false;
+
+        for (;;)
+        {
+            const ssize_t r = read(client_fd, tmp, sizeof(tmp));
+            if (r > 0)
+            {
+                buf.append(tmp, r);
+                continue;
+            }
+            if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            {
+                closed = true; // still deliver what was buffered before the peer hung up
+            }
+            break; // closed, or EAGAIN: drained
+        }
+        for (size_t pos; (pos = buf.find('\0')) != std::string::npos;)
+        {
+            if (pos > 0) // zero padding of the fixed-size frame yields empty messages
+            {
+                std::cout << std::format("Message received: {}", buf.substr(0, pos)) << std::endl;
+            }
+            buf.erase(0, pos + 1);
+        }
+        if (closed)
+        {
+            // remove the client from the epoll reactor
+            if (!m_reactor.remove(client_fd))
+            {
+                // unhandled error, but we still want to close the connection
+            }
+            closeClientConnection(client_fd); // destroy the fd
+        }
+    }
 
 private:
     static constexpr int MAX_CONNECTIONS{10};
     FileDescriptor m_socket;
     std::string m_ip;
-    std::vector<FileDescriptor> m_clients;
+    std::unordered_map<int, network::Connection> m_clients;
     int m_port;
+    network::EpollReactor &m_reactor;
 };
 
 
