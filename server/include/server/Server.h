@@ -10,12 +10,14 @@
 #include <arpa/inet.h>
 #include <asm-generic/socket.h>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <format>
 #include <iostream>
 #include <netinet/in.h>
 #include <stdexcept>
 #include <string>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -74,7 +76,8 @@ public:
         }
 
         // register the server socket with the epoll reactor
-        if (!m_reactor.add(m_socket.get(), EPOLLIN, [this](int fd) { this->accept(); }))
+        uint32_t events = EPOLLIN;
+        if (!m_reactor.add(m_socket.get(), events, [this, events](int fd, uint32_t events_in) { this->accept(); }))
         {
             throw std::runtime_error("Failed to add server socket to epoll reactor");
         }
@@ -115,7 +118,9 @@ public:
                 }
 
                 network::Connection new_client(fd_temp);
-                if (!m_reactor.add(fd_temp, EPOLLIN | EPOLLET, [this](int fd) { this->clientCallback(fd); }))
+                uint32_t events = EPOLLIN | EPOLLET; // edge-triggered read events
+                if (!m_reactor.add(fd_temp, events,
+                                   [this, events](int fd, uint32_t events_in) { this->clientCallback(fd, events_in); }))
                 {
                     return; // let the client socket be closed by the destructor of new_client
                 }
@@ -135,7 +140,7 @@ public:
     [[nodiscard]] int get() const { return m_socket.get(); }
 
 private:
-    void clientCallback(int client_fd)
+    void clientCallback(int client_fd, uint32_t events)
     {
         auto client_it = m_clients.find(client_fd);
 
