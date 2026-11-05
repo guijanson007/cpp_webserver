@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <asm-generic/socket.h>
 #include <cerrno>
 #include <cstring>
 #include <format>
@@ -56,7 +57,7 @@ public:
         }
         int opt = 1;
         // set socket options to allow address reuse
-        if (0 > ::setsockopt(m_socket.get(), SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)))
+        if (0 > ::setsockopt(m_socket.get(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
         {
             throw std::runtime_error("Failed to set socket options");
         }
