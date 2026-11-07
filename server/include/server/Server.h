@@ -19,6 +19,7 @@
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <common/FileDescriptor.h>
@@ -130,8 +131,59 @@ public:
         }
     }
 
+    bool flush(network::Connection &client)
+    {
+        std::string &write_buffer = client.getWriteBuffer();
 
-    void closeClientConnection(int fd) { m_clients.erase(fd); }
+        while (!write_buffer.empty())
+        {
+            ssize_t bytes_sent = ::send(client.getFd(), write_buffer.data(), write_buffer.size(), MSG_NOSIGNAL);
+
+            if (bytes_sent < 0)
+            {
+                if (errno == EAGAIN)
+                {
+                    m_reactor.modify(client.getFd(), EPOLLIN | EPOLLOUT | EPOLLET); // wait for the next writable event
+                    client.setWaitingForWrite(true);
+                    return true; // not all data was sent; will try again later
+                }
+                if (errno == EINTR)
+                {
+                    // Interrupted by a signal; retry the send operation.
+                    continue;
+                }
+
+                // Fatal error
+                std::cerr << "Error sending data to client: " << std::strerror(errno) << std::endl;
+                return false;
+            }
+
+            if (bytes_sent == 0)
+            {
+                // Zero-byte send can indicate a closed connection depending on context
+                std::cerr << "Client closed the connection unexpectedly." << std::endl;
+                break;
+            }
+
+            write_buffer.erase(0, bytes_sent);
+        }
+        if (client.isWaitingForWrite())
+        {
+            client.setWaitingForWrite(false);
+            if (!m_reactor.modify(client.getFd(), EPOLLIN | EPOLLET))
+            {
+                std::cerr << "Error modifying client fd to EPOLLIN: " << std::strerror(errno) << std::endl;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void closeClientConnection(int fd)
+    {
+        m_reactor.remove(fd);
+        m_clients.erase(fd);
+    }
 
     [[nodiscard]] std::string getIp() const { return m_ip; }
 
@@ -155,6 +207,11 @@ private:
         char tmp[1028];
         bool closed = false;
 
+        if (events & EPOLLERR || events & EPOLLHUP)
+        {
+            closed = true; // peer closed the connection or an error occurred
+        }
+
         for (;;)
         {
             const ssize_t r = read(client_fd, tmp, sizeof(tmp));
@@ -174,16 +231,17 @@ private:
             if (pos > 0) // zero padding of the fixed-size frame yields empty messages
             {
                 std::cout << std::format("Message received: {}", buf.substr(0, pos)) << std::endl;
+
+                if (events & EPOLLOUT)
+                {
+                    client.queueWrite(buf.substr(0, pos)); // echo back the message
+                }
             }
             buf.erase(0, pos + 1);
         }
-        if (closed)
+
+        if (closed || !flush(client)) // flush returns false on fatal error
         {
-            // remove the client from the epoll reactor
-            if (!m_reactor.remove(client_fd))
-            {
-                // unhandled error, but we still want to close the connection
-            }
             closeClientConnection(client_fd); // destroy the fd
         }
     }
