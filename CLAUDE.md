@@ -108,15 +108,20 @@ scripts/check_reactor.sh                 WEB-2 check (strace double close, SIGST
 docs/tickets/WEB-<n>.md                  tickets from /next_task
 ```
 
-## Current architecture (after WEB-2)
+## Current architecture (after WEB-4)
 
 - `EpollReactor` is a dumb dispatcher: `add(fd, events, handler)`, `modify`, `remove`,
   `run()` (one `epoll_wait` pass, returns false on fatal error). Handlers are
-  `std::function<void(int fd)>`. `run()` copies the handler before calling it, so a
+  `std::function<void(int fd, uint32_t events)>`. `run()` copies the handler before calling it, so a
   handler may `remove()` itself. It knows nothing about sockets or protocols.
 - `Server` owns the listening socket and `unordered_map<int, Connection>`. The listener
   is level-triggered; clients are `EPOLLIN | EPOLLET` and are drained until `EAGAIN`.
-  `accept()` loops until `EAGAIN`, sheds connections over the cap with `continue`.
+  `accept()` loops until `EAGAIN`, sheds connections over the cap with `continue`. On
+  `EMFILE`/`ENFILE` it uses a spare `/dev/null` fd: release it, accept and close one
+  connection, reopen the spare, so the level-triggered listener does not spin.
+- `ServerConfig` (`server/ServerConfig.h`) holds `ip`, `port`, `maxConnections` (default
+  100) and `backlogSize` (default 10'000). `main` parses `--port`, `--max-connections`,
+  `--backlog` into it. The kernel caps the backlog at `net.core.somaxconn`.
 - `Connection` owns its `FileDescriptor` and read buffer. Closing = `reactor.remove(fd)`
   then erase from the map (the destructor closes the fd; never call raw `close` on an
   fd a `Connection` owns).
@@ -126,9 +131,11 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
-  WEB-2 (done, committed). Next is WEB-3 (write path + `EPOLLOUT`).
-- Verification scripts live in `scripts/`. `strace` is not installed on the dev machine
-  yet (`sudo dnf install strace`), so the strace parts of `check_reactor.sh` were never run.
+  WEB-4 (done, PR open). Next: M1 cleanup ticket, then M2 (HTTP parser).
+- Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
+  `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
+  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion). All pass on `web-4`.
+  Scripts count connections with `ss`, not server logs. Pass `--max-connections` explicitly.
 
 ## Build
 
@@ -146,22 +153,27 @@ Fixed (WEB-1, WEB-2): accept crash at the cap, `#define` macros, `<algorithm>`, 
 checks, one-accept-per-wakeup, epoll mixed into `main`, double close on failed epoll
 registration, `EINTR` in `epoll_wait`.
 
-Fixed (WEB-3, pending close): write path (`Connection` output buffer, `EPOLLOUT` armed on
+Fixed (WEB-3): write path (`Connection` output buffer, `EPOLLOUT` armed on
 `EAGAIN` and disarmed on drain, half-close flushes before closing), `MSG_NOSIGNAL`,
 handler carries `uint32_t events`, `SO_REUSEADDR` with a named `int opt`, `bool` returns
 on `add`/`modify`/`remove`, fd I/O behind `network/SocketIo.h`, over-limit shed via
 `Connection::close()`. `scripts/check_write_path.sh` covers echo, RST survival,
 backpressure, `EPOLLOUT` not armed for a small echo.
 
+Fixed (WEB-4): configurable connection cap and separate backlog via `ServerConfig` and
+flags, `EMFILE`/`ENFILE` busy loop (spare fd), `explicit Connection(int)`, `Connection`
+built only after a successful accept, per-accept logging removed, `check_reactor.sh`
+no longer depends on server logs. 10k idle connections verified by `check_scale.sh`.
+
 Open:
 
-- `MAX_CONNECTIONS` (10) is far too low for the 10k goal and doubles as the `listen`
-  backlog. Make the limit configurable and give the backlog its own (large) setting.
-  The backlog is the kernel accept queue, not a concurrent-client cap. (WEB-4)
+- Argument parsing: `std::stoi` accepts trailing garbage and there are no range checks
+  for port, cap or backlog.
+- `EMFILE` message prints with `endl` on every discard (rate-limit or drop).
+- `MAX_EVENTS` is 10'000, a guess. Settle by profiling.
 - Leftover includes (`<asm-generic/socket.h>` in `Server.h`), unused `getFd()` on the
   reactor; `accept4` is still called directly in `Server`.
 - Wire protocol (NUL-padded frames) disappears once HTTP lands.
-- `check_reactor.sh` strace checks (double close, attach/detach) not yet run.
 - `flush()` calls `modify()` on every successful flush, and again on every `EAGAIN` even
   when `EPOLLOUT` is already armed (seen with `strace -e epoll_ctl`). Only call it on a
   state change (`isWaitingForWrite()`).
@@ -177,7 +189,7 @@ Open:
   connection closes, which changes the "dumb dispatcher" reactor design. Decide together
   with edge- vs level-triggered (level-triggered needs no queue) as a profiling ticket
   after M3: baseline = `wrk` with one bulk sender next to many small clients, measure the
-  small clients' latency. Out of scope for WEB-3.
+  small clients' latency.
 
 ## Interview talking points (prepare per milestone)
 

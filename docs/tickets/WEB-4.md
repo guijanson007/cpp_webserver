@@ -1,6 +1,6 @@
 # WEB-4: Make the connection limit configurable and survive fd exhaustion
 
-**Status:** Open
+**Status:** Done (acceptance criteria met; see "Outcome")
 **Type:** Task
 **Milestone:** M1 - Cleanup
 **Priority:** High. It blocks the "10k+ concurrent keep-alive connections" Definition of Done item and is the last big M1 item before the HTTP work.
@@ -26,16 +26,16 @@
 
 ## Acceptance criteria (Definition of Done)
 
-- [ ] `MAX_CONNECTIONS` is gone. The cap and the backlog come from `ServerConfig`, and the backlog is a separate field with its own default.
-- [ ] `scripts/check_scale.sh` passes all three phases:
+- [x] `MAX_CONNECTIONS` is gone. The cap and the backlog come from `ServerConfig`, and the backlog is a separate field with its own default.
+- [x] `scripts/check_scale.sh` passes all three phases:
   - cap of 100 with 150 clients keeps exactly 100;
   - 10,000 idle connections are held, a fresh client still gets its echo, and idle CPU is under 10%;
   - fd exhaustion (`ulimit -n 256`, 400 clients) leaves the server alive, with CPU under 50% over 2 s and recovery once fds are freed.
-- [ ] `scripts/check_connection_limit.sh`, `check_write_path.sh` and `check_reactor.sh` still pass (all three pass on `main` today).
-- [ ] The behaviour at `EMFILE` is chosen deliberately and explained in a comment.
-- [ ] Builds clean with no new warnings.
-- [ ] No new raw syscalls outside `SocketIo`/reactor. `accept4` stays where it is until the wrapper ticket.
-- [ ] Small, focused commits with `WEB-4` in the message.
+- [x] `scripts/check_connection_limit.sh`, `check_write_path.sh` and `check_reactor.sh` still pass (all three pass on `main` today).
+- [x] The behaviour at `EMFILE` is chosen deliberately and explained in a comment.
+- [x] Builds clean with no new warnings.
+- [x] No new raw syscalls outside `SocketIo`/reactor. `accept4` stays where it is until the wrapper ticket.
+- [x] Small, focused commits with `WEB-4` in the message.
 
 ## Technical notes / hints
 
@@ -63,6 +63,25 @@ scripts/check_reactor.sh               # regression
 ## Dependencies
 
 Blocked by: none (WEB-3 is merged). Blocks: M2 and the 10k Definition of Done check. Follow-ups: the `flush()` `modify()` churn, and removing the leftover `<asm-generic/socket.h>` include and the unused `getFd()`.
+
+## Outcome
+
+All four scripts pass on `web-4`: `check_scale.sh` (cap of 100 with 150 clients, 10,000 idle connections with 0% idle CPU, fd exhaustion at `ulimit -n 256` with no busy loop and recovery), plus `check_connection_limit.sh`, `check_write_path.sh` and `check_reactor.sh`. The build has no warnings.
+
+What was done:
+
+- `ServerConfig` aggregate (`ip` as `std::string`, `port`, `maxConnections`, `backlogSize`) and `main` flags `--port`, `--max-connections`, `--backlog`. The backlog is separate from the cap.
+- `EMFILE`/`ENFILE` handled with a spare fd (`/dev/null`): release it, `accept4` one connection, close it, reopen the spare. The level-triggered listener keeps draining the queue instead of spinning.
+- `Connection(int)` is `explicit`. `accept()` builds the `Connection` only after a successful `accept4`. The cap check is `>=` with an explicit `int` cast.
+- Per-accept logging removed. Diagnostics go to `cerr`. `sync_with_stdio(false)` in `main`. `MAX_EVENTS` raised from 10 to 10,000 (a guess to settle by profiling).
+- `check_reactor.sh` counts accepted connections with `ss` instead of grepping the server log, so it no longer depends on stdout buffering. `check_reactor.sh` and `check_connection_limit.sh` pass `--max-connections` explicitly.
+
+Follow-ups left open (recorded in CLAUDE.md "Known issues"):
+
+- `std::stoi` accepts trailing garbage and has no range checks for port, cap or backlog.
+- `<asm-generic/socket.h>` include, unused `getFd()` on `Connection` and the reactor, direct `accept4`.
+- `flush()` `modify()` churn and the quadratic `processFrames`.
+- The `EMFILE` message prints on every discard.
 
 ## Interview talking point
 
