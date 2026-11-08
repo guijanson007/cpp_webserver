@@ -87,7 +87,12 @@ PY
 
 close_clients() {
   [[ -n "$HOLDER_PID" ]] && kill "$HOLDER_PID" 2>/dev/null && wait "$HOLDER_PID" 2>/dev/null
-  HOLDER_PID=""
+  HOLDER_PID=$!
+  for _ in $(seq 100); do
+    [[ -s "$TMPDIR_CHECK/opened" ]] && return 0
+    sleep 0.2
+  done
+  fail "client holder did not finish connecting"
 }
 
 # echo_ok: a fresh client sends one frame and must get it back.
@@ -105,6 +110,16 @@ try:
         data += chunk
 except OSError:
     pass
+    python3 -I - "$PORT" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3)
+s.sendall(b"ping\0")
+data = b""
+while not data.endswith(b"\0"):
+    chunk = s.recv(64)
+    if not chunk:
+        break
+    data += chunk
 sys.exit(0 if data == b"ping\0" else 1)
 PY
 }
