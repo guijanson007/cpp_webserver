@@ -6,17 +6,21 @@
 #define SERVER_SERVER_H
 
 
-#include <algorithm>
 #include <arpa/inet.h>
+#include <asm-generic/socket.h>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <format>
 #include <iostream>
 #include <netinet/in.h>
 #include <stdexcept>
 #include <string>
+#include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
+#include "network/SocketIo.h"
 
 #include <common/FileDescriptor.h>
 #include "network/Connection.h"
@@ -56,7 +60,7 @@ public:
         }
         int opt = 1;
         // set socket options to allow address reuse
-        if (0 > ::setsockopt(m_socket.get(), SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)))
+        if (0 > ::setsockopt(m_socket.get(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
         {
             throw std::runtime_error("Failed to set socket options");
         }
@@ -73,7 +77,8 @@ public:
         }
 
         // register the server socket with the epoll reactor
-        if (!m_reactor.add(m_socket.get(), EPOLLIN, [this](int fd) { this->accept(); }))
+        uint32_t events = EPOLLIN;
+        if (!m_reactor.add(m_socket.get(), events, [this, events](int fd, uint32_t events_in) { this->accept(); }))
         {
             throw std::runtime_error("Failed to add server socket to epoll reactor");
         }
@@ -86,6 +91,7 @@ public:
         while (true)
         {
             fd_temp = ::accept4(m_socket.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            network::Connection new_client(fd_temp);
             if (fd_temp < 0)
             {
                 if (errno == EAGAIN)
@@ -109,12 +115,13 @@ public:
                 if (m_clients.size() == MAX_CONNECTIONS)
                 {
                     std::cout << "Max connections reached. Closing the new connection." << std::endl;
-                    ::close(fd_temp);
+                    new_client.close();
                     continue; // keep draining the accept queue
                 }
 
-                network::Connection new_client(fd_temp);
-                if (!m_reactor.add(fd_temp, EPOLLIN | EPOLLET, [this](int fd) { this->clientCallback(fd); }))
+                uint32_t events = EPOLLIN | EPOLLET; // edge-triggered read events
+                if (!m_reactor.add(fd_temp, events,
+                                   [this, events](int fd, uint32_t events_in) { this->clientCallback(fd, events_in); }))
                 {
                     return; // let the client socket be closed by the destructor of new_client
                 }
@@ -124,8 +131,75 @@ public:
         }
     }
 
+    bool flush(network::Connection &client)
+    {
+        using namespace network;
 
-    void closeClientConnection(int fd) { m_clients.erase(fd); }
+        std::string &write_buffer = client.getWriteBuffer();
+        if (write_buffer.empty())
+        {
+            // If the peer already closed their write end (our read end), and
+            // our write buffer is fully drained, teardown the connection.
+            if (client.isReadClosed())
+            {
+                closeClientConnection(client.getFd());
+                return true;
+            }
+            return true;
+        }
+
+        SocketIoResult result = SocketIo::writeSome(client.getFd(), write_buffer);
+
+        if (result == SocketIoResult::Error || result == SocketIoResult::Eof)
+        {
+            closeClientConnection(client.getFd());
+            return false;
+        }
+
+        if (result == SocketIoResult::Again)
+        {
+            // Register EPOLLOUT. If read side is closed, do NOT register EPOLLIN.
+            uint32_t events = EPOLLOUT | EPOLLET;
+            if (!client.isReadClosed())
+            {
+                events |= EPOLLIN;
+            }
+
+            if (!m_reactor.modify(client.getFd(), events))
+            {
+                closeClientConnection(client.getFd());
+                return false;
+            }
+
+            client.setWaitingForWrite(true);
+            return true;
+        }
+
+        if (result == SocketIoResult::Ok)
+        {
+            client.setWaitingForWrite(false);
+
+            // If the read channel is closed, draining all writes means we are done.
+            if (client.isReadClosed())
+            {
+                closeClientConnection(client.getFd());
+                return true;
+            }
+
+            // Restore to read-only monitoring
+            if (!m_reactor.modify(client.getFd(), EPOLLIN | EPOLLET))
+            {
+                closeClientConnection(client.getFd());
+                return false;
+            }
+        }
+        return true;
+    }
+    void closeClientConnection(int fd)
+    {
+        m_reactor.remove(fd);
+        m_clients.erase(fd);
+    }
 
     [[nodiscard]] std::string getIp() const { return m_ip; }
 
@@ -134,51 +208,75 @@ public:
     [[nodiscard]] int get() const { return m_socket.get(); }
 
 private:
-    void clientCallback(int client_fd)
+    static void processFrames(network::Connection &client)
     {
-        auto client_it = m_clients.find(client_fd);
+        auto &buf = client.getReadBuffer();
+        for (size_t pos; (pos = buf.find('\0')) != std::string::npos;)
+        {
+            if (pos > 0)
+            {
+                std::cout << std::format("Message received: {}", buf.substr(0, pos)) << std::endl;
+                client.queueWrite(buf.substr(0, pos) + '\0');
+            }
+            buf.erase(0, pos + 1);
+        }
+    }
 
+    void clientCallback(int client_fd, uint32_t events)
+    {
+        using namespace network;
+
+        auto client_it = m_clients.find(client_fd);
         if (client_it == m_clients.end())
         {
-            std::cout << std::format("Client with fd {} not found", client_fd) << std::endl;
             return;
         }
         auto &client = client_it->second;
 
-        auto &buf = client.getReadBuffer();
-        char tmp[1028];
-        bool closed = false;
+        // Fatal hardware/epoll error: tear down immediately
+        if (events & EPOLLERR)
+        {
+            closeClientConnection(client_fd);
+            return;
+        }
 
-        for (;;)
+        // Drain pending write buffer on EPOLLOUT
+        if ((events & EPOLLOUT) && client.isWaitingForWrite())
         {
-            const ssize_t r = read(client_fd, tmp, sizeof(tmp));
-            if (r > 0)
+            if (!flush(client))
             {
-                buf.append(tmp, r);
-                continue;
+                return; // flush handles closeClientConnection on error/completion
             }
-            if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+
+            // Re-check existence in case flush() drained and closed a half-closed client
+            if (m_clients.find(client_fd) == m_clients.end())
             {
-                closed = true; // still deliver what was buffered before the peer hung up
+                return;
             }
-            break; // closed, or EAGAIN: drained
         }
-        for (size_t pos; (pos = buf.find('\0')) != std::string::npos;)
+
+        // Read incoming data (only if read side isn't already closed)
+        if (!client.isReadClosed() && (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)))
         {
-            if (pos > 0) // zero padding of the fixed-size frame yields empty messages
+            auto &buf = client.getReadBuffer();
+            SocketIoResult result = SocketIo::readSome(client_fd, buf);
+
+            if (result == SocketIoResult::Error)
             {
-                std::cout << std::format("Message received: {}", buf.substr(0, pos)) << std::endl;
+                closeClientConnection(client_fd);
+                return;
             }
-            buf.erase(0, pos + 1);
-        }
-        if (closed)
-        {
-            // remove the client from the epoll reactor
-            if (!m_reactor.remove(client_fd))
+
+            // Parse any complete messages received before/at EOF
+            processFrames(client);
+
+            if (result == SocketIoResult::Eof)
             {
-                // unhandled error, but we still want to close the connection
+                client.setReadClosed(true);
             }
-            closeClientConnection(client_fd); // destroy the fd
+
+            // Flush queued echoes out to socket
+            flush(client);
         }
     }
 

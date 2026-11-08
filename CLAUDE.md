@@ -146,22 +146,38 @@ Fixed (WEB-1, WEB-2): accept crash at the cap, `#define` macros, `<algorithm>`, 
 checks, one-accept-per-wakeup, epoll mixed into `main`, double close on failed epoll
 registration, `EINTR` in `epoll_wait`.
 
+Fixed (WEB-3, pending close): write path (`Connection` output buffer, `EPOLLOUT` armed on
+`EAGAIN` and disarmed on drain, half-close flushes before closing), `MSG_NOSIGNAL`,
+handler carries `uint32_t events`, `SO_REUSEADDR` with a named `int opt`, `bool` returns
+on `add`/`modify`/`remove`, fd I/O behind `network/SocketIo.h`, over-limit shed via
+`Connection::close()`. `scripts/check_write_path.sh` covers echo, RST survival,
+backpressure, `EPOLLOUT` not armed for a small echo.
+
 Open:
 
-- No write path (no output buffer, no `EPOLLOUT`). This is WEB-3.
 - `MAX_CONNECTIONS` (10) is far too low for the 10k goal and doubles as the `listen`
   backlog. Make the limit configurable and give the backlog its own (large) setting.
-  The backlog is the kernel accept queue, not a concurrent-client cap.
-- `SO_REUSEADDR` in `Server::start()` passes the fd number (`&temp_socket`) as the
-  option value; works by accident. Use a named `int opt = 1` and check the result.
-- `modify()` / `remove()` return `int`, `add()` returns `bool`: make consistent.
-- Handler signature is `void(int fd)` and ignores `events`; WEB-3 needs the events
-  (`EPOLLOUT`, `EPOLLERR`, `EPOLLHUP`), so change it to carry `uint32_t events`.
-- Leftover/missing includes in `EpollReactor.h` / `Server.h`; unused `getFd()`.
-- Over-limit shedding uses raw `::close`; fd I/O still calls raw `read` in
-  `Server::clientCallback` (move behind the wrapper layer).
+  The backlog is the kernel accept queue, not a concurrent-client cap. (WEB-4)
+- Leftover includes (`<asm-generic/socket.h>` in `Server.h`), unused `getFd()` on the
+  reactor; `accept4` is still called directly in `Server`.
 - Wire protocol (NUL-padded frames) disappears once HTTP lands.
 - `check_reactor.sh` strace checks (double close, attach/detach) not yet run.
+- `flush()` calls `modify()` on every successful flush, and again on every `EAGAIN` even
+  when `EPOLLOUT` is already armed (seen with `strace -e epoll_ctl`). Only call it on a
+  state change (`isWaitingForWrite()`).
+- `processFrames` does `buf.erase(0, pos + 1)` per frame: quadratic on big bursts
+  (measured: 20k frames 0.37 s, 40k 0.53 s, 80k 3.39 s). Profiling candidate: parse with
+  an offset and compact once.
+- `readSome` drains until `EAGAIN` with no cap, so one fast sender can starve the other
+  clients and grow the read buffer without bound. Memory is fixed by the M2 size limits
+  (413/431), not by a read cap.
+- **Idea (roadmap, not built):** bounded reads per wakeup plus a ready queue so an
+  `EPOLLET` connection that was not fully drained is resumed without losing its edge.
+  Needs `epoll_wait` with a zero timeout while the queue is non-empty and cleanup when a
+  connection closes, which changes the "dumb dispatcher" reactor design. Decide together
+  with edge- vs level-triggered (level-triggered needs no queue) as a profiling ticket
+  after M3: baseline = `wrk` with one bulk sender next to many small clients, measure the
+  small clients' latency. Out of scope for WEB-3.
 
 ## Interview talking points (prepare per milestone)
 

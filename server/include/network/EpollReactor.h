@@ -31,7 +31,7 @@ namespace network
         EpollReactor &operator=(const EpollReactor &) = delete;
         ~EpollReactor() = default;
 
-        bool add(int fd, uint32_t events, std::function<void(int)> handler)
+        bool add(int fd, uint32_t events, std::function<void(int, uint32_t)> handler)
         {
             struct epoll_event event{};
             event.data.fd = fd;
@@ -98,7 +98,7 @@ namespace network
 
                 auto handler = it->second; // copy the handler to avoid issues if the handler modifies m_handlers
 
-                handler(client_fd); // Call the handler for this fd
+                handler(client_fd, m_events[n].events); // Call the handler for this fd
             }
             return true;
         }
@@ -109,7 +109,7 @@ namespace network
         static constexpr int MAX_EVENTS = 10;
         static constexpr int EPOLL_TIMEOUT = -1; // Wait indefinitely
         FileDescriptor m_epollFd;
-        std::unordered_map<int, std::function<void(int)>> m_handlers; // handler for each client
+        std::unordered_map<int, std::function<void(int, uint32_t)>> m_handlers; // handler for each client
         std::array<struct epoll_event, MAX_EVENTS> m_events{};
     };
 } // namespace network
