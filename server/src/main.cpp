@@ -15,7 +15,7 @@
 ServerConfig parseArguments(int argc, char *argv[])
 {
     // Start with default values
-    ServerConfig config{};
+    ServerConfig config{"0.0.0.0", 8080, 10, 10'000};
 
     for (int i = 1; i < argc; ++i)
     {
@@ -62,7 +62,6 @@ int main(int argc, char *argv[])
     }
 
     Server server(config, epollReactor);
-
     try
     {
         server.start();
