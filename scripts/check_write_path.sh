@@ -156,6 +156,23 @@ case $? in
 esac
 server_alive && pass "backpressure: server still running" || fail "backpressure: server died"
 
+# ---- 3b. half-close: echo must be flushed before the server closes ----------
+python3 -I - "$PORT" <<'EOF'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+payload = b"".join(b"%08d" % i + b"a" * 92 + b"\0" for i in range(20000))
+s.sendall(payload)
+s.shutdown(socket.SHUT_WR)          # no more input; we still read the replies
+got = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break                        # server closed after draining
+    got += chunk
+sys.exit(0 if got.replace(b"\0", b"") == payload.replace(b"\0", b"") else 1)
+EOF
+[[ $? -eq 0 ]] && pass "half-close: full echo received, then server closed" || fail "half-close: echo lost or connection never closed"
+
 # ---- 4. EPOLLOUT armed only when needed (strace) ---------------------------
 if ! command -v strace >/dev/null; then
     skip "epollout: strace not installed (sudo dnf install strace)"
