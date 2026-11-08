@@ -9,7 +9,7 @@ namespace network
     class Connection
     {
     public:
-        Connection(int fd) : m_clientFd(fd), m_readBuffer{} {}
+        explicit Connection(int fd) : m_clientFd(fd), m_readBuffer{} {}
         Connection(const Connection &) = delete;
         Connection &operator=(const Connection &) = delete;
         Connection(Connection &&) = default;
