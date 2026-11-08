@@ -26,14 +26,28 @@ namespace network
 
         void clearWriteBuffer() { m_writeBuffer.clear(); }
 
+        void setReadClosed(bool closed) { m_readClosed = closed; }
+
+        [[nodiscard]] bool isReadClosed() const { return m_readClosed; }
+
         void setWaitingForWrite(bool waiting) { m_waitingForWrite = waiting; }
 
         [[nodiscard]] bool isWaitingForWrite() const { return m_waitingForWrite; }
+
+        void close()
+        {
+            if (m_clientFd.get() != -1)
+            {
+                // destroy the file descriptor, which will close the socket
+                m_clientFd = FileDescriptor(-1);
+            }
+        }
 
     private:
         FileDescriptor m_clientFd;
         std::string m_readBuffer;
         std::string m_writeBuffer;
         bool m_waitingForWrite{false};
+        bool m_readClosed{false};
     };
 } // namespace network
