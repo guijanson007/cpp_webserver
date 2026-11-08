@@ -39,7 +39,7 @@ namespace network
 
             if (-1 == ::epoll_ctl(m_epollFd.get(), EPOLL_CTL_ADD, fd, &event))
             {
-                std::cout << "Failed to add file descriptor to epoll instance: " << strerror(errno) << std::endl;
+                std::cerr << "Failed to add file descriptor to epoll instance: " << strerror(errno) << std::endl;
                 return false;
             }
             m_handlers[fd] = std::move(handler);
@@ -54,7 +54,7 @@ namespace network
 
             if (-1 == ::epoll_ctl(m_epollFd.get(), EPOLL_CTL_MOD, fd, &event))
             {
-                std::cout << "Failed to modify file descriptor in epoll instance: " << strerror(errno) << std::endl;
+                std::cerr << "Failed to modify file descriptor in epoll instance: " << strerror(errno) << std::endl;
                 return false;
             }
             return true;
@@ -64,7 +64,7 @@ namespace network
         {
             if (-1 == ::epoll_ctl(m_epollFd.get(), EPOLL_CTL_DEL, fd, nullptr))
             {
-                std::cout << "Failed to remove file descriptor from epoll instance: " << strerror(errno) << std::endl;
+                std::cerr << "Failed to remove file descriptor from epoll instance: " << strerror(errno) << std::endl;
                 m_handlers.erase(fd);
                 return false;
             }
@@ -84,7 +84,7 @@ namespace network
                 }
                 if (errno != EINTR)
                 {
-                    std::cout << "Failed to wait for events: " << strerror(errno) << std::endl;
+                    std::cerr << "Failed to wait for events: " << strerror(errno) << std::endl;
                     return false;
                 }
             } while (errno == EINTR);
@@ -103,10 +103,8 @@ namespace network
             return true;
         }
 
-        [[nodiscard]] int getFd() const { return m_epollFd.get(); }
-
     private:
-        static constexpr int MAX_EVENTS = 10;
+        static constexpr int MAX_EVENTS = 10'000;
         static constexpr int EPOLL_TIMEOUT = -1; // Wait indefinitely
         FileDescriptor m_epollFd;
         std::unordered_map<int, std::function<void(int, uint32_t)>> m_handlers; // handler for each client

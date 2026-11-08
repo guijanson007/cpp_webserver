@@ -9,8 +9,10 @@
 #include <arpa/inet.h>
 #include <asm-generic/socket.h>
 #include <cerrno>
+#include <common/FileDescriptor.h>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <format>
 #include <iostream>
 #include <netinet/in.h>
@@ -20,26 +22,34 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include "network/SocketIo.h"
-
-#include <common/FileDescriptor.h>
+#include <unordered_map>
+#include <utility>
 #include "network/Connection.h"
 #include "network/EpollReactor.h"
+#include "network/SocketIo.h"
+#include "server/ServerConfig.h"
 
 class Server
 {
 public:
-    Server(std::string ip, int port, network::EpollReactor &reactor)
-        : m_ip(std::move(ip)), m_port(port), m_reactor(reactor)
+    Server(ServerConfig config, network::EpollReactor &reactor) : m_config(std::move(config)), m_reactor(reactor)
     {
-        m_clients.reserve(MAX_CONNECTIONS);
+        m_clients.reserve(config.maxConnections);
     }
+
     Server(const Server &) = delete;
     Server &operator=(const Server &) = delete;
 
     void start()
     {
         struct sockaddr_in s_addr{};
+
+        int spare = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (spare < 0)
+        {
+            throw std::runtime_error("Failed to allocate reserve file descriptor");
+        }
+        m_spare_fd = FileDescriptor(spare);
 
         int temp_socket = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
         if (temp_socket < 0)
@@ -51,10 +61,10 @@ public:
 
         std::memset(&s_addr, 0, sizeof(s_addr));
         s_addr.sin_family = AF_INET;
-        s_addr.sin_port = ::htons(m_port);
+        s_addr.sin_port = ::htons(m_config.port);
 
         // s_addr.sin_addr.s_addr = INADDR_ANY;
-        if (1 != ::inet_pton(AF_INET, m_ip.c_str(), &s_addr.sin_addr))
+        if (1 != ::inet_pton(AF_INET, m_config.ip.c_str(), &s_addr.sin_addr))
         {
             throw std::runtime_error("Invalid IP address");
         }
@@ -70,8 +80,7 @@ public:
             throw std::runtime_error("Failed to bind socket");
         }
 
-        // backlog size is set to 1000 times the max connections
-        if (0 > ::listen(m_socket.get(), MAX_CONNECTIONS * 1000))
+        if (0 > ::listen(m_socket.get(), m_config.backlogSize))
         {
             throw std::runtime_error("Failed to listen on socket");
         }
@@ -91,9 +100,16 @@ public:
         while (true)
         {
             fd_temp = ::accept4(m_socket.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
-            network::Connection new_client(fd_temp);
             if (fd_temp < 0)
             {
+
+                if (errno == EMFILE || errno == ENFILE)
+                {
+                    std::cerr << "Process or system FD limit exhausted. Discarding incoming client.\n";
+                    discardExcessConnection();
+                    return;
+                }
+
                 if (errno == EAGAIN)
                 {
                     return; // no more connections to accept
@@ -101,7 +117,7 @@ public:
 
                 if (errno != EINTR)
                 {
-                    std::cout << std::format("Failed to accept connection: {}", std::strerror(errno)) << std::endl;
+                    std::cerr << std::format("Failed to accept connection: {}", std::strerror(errno)) << std::endl;
                     return;
                 }
                 else
@@ -112,9 +128,11 @@ public:
             }
             else // successfully accepted a new connection
             {
-                if (m_clients.size() == MAX_CONNECTIONS)
+                network::Connection new_client(fd_temp);
+
+                if (static_cast<int>(m_clients.size()) >= m_config.maxConnections)
                 {
-                    std::cout << "Max connections reached. Closing the new connection." << std::endl;
+                    std::cerr << "Max connections reached. Closing the new connection." << std::endl;
                     new_client.close();
                     continue; // keep draining the accept queue
                 }
@@ -125,7 +143,6 @@ public:
                 {
                     return; // let the client socket be closed by the destructor of new_client
                 }
-                std::cout << std::format("Connection accepted: {}", std::to_string(fd_temp)) << std::endl;
                 m_clients.insert({fd_temp, std::move(new_client)});
             }
         }
@@ -138,12 +155,9 @@ public:
         std::string &write_buffer = client.getWriteBuffer();
         if (write_buffer.empty())
         {
-            // If the peer already closed their write end (our read end), and
-            // our write buffer is fully drained, teardown the connection.
             if (client.isReadClosed())
             {
                 closeClientConnection(client.getFd());
-                return true;
             }
             return true;
         }
@@ -158,56 +172,93 @@ public:
 
         if (result == SocketIoResult::Again)
         {
-            // Register EPOLLOUT. If read side is closed, do NOT register EPOLLIN.
-            uint32_t events = EPOLLOUT | EPOLLET;
-            if (!client.isReadClosed())
+            // Only call modify if we are NOT already armed for EPOLLOUT
+            if (!client.isWaitingForWrite())
             {
-                events |= EPOLLIN;
-            }
+                uint32_t events = EPOLLOUT | EPOLLET;
+                if (!client.isReadClosed())
+                {
+                    events |= EPOLLIN;
+                }
 
-            if (!m_reactor.modify(client.getFd(), events))
-            {
-                closeClientConnection(client.getFd());
-                return false;
-            }
+                if (!m_reactor.modify(client.getFd(), events))
+                {
+                    closeClientConnection(client.getFd());
+                    return false;
+                }
 
-            client.setWaitingForWrite(true);
+                client.setWaitingForWrite(true);
+            }
             return true;
         }
 
         if (result == SocketIoResult::Ok)
         {
-            client.setWaitingForWrite(false);
+            // Only modify epoll if we PREVIOUSLY armed EPOLLOUT
+            if (client.isWaitingForWrite())
+            {
+                client.setWaitingForWrite(false);
 
-            // If the read channel is closed, draining all writes means we are done.
-            if (client.isReadClosed())
+                if (client.isReadClosed())
+                {
+                    closeClientConnection(client.getFd());
+                    return true;
+                }
+
+                if (!m_reactor.modify(client.getFd(), EPOLLIN | EPOLLET))
+                {
+                    closeClientConnection(client.getFd());
+                    return false;
+                }
+            }
+            else if (client.isReadClosed())
             {
                 closeClientConnection(client.getFd());
                 return true;
             }
-
-            // Restore to read-only monitoring
-            if (!m_reactor.modify(client.getFd(), EPOLLIN | EPOLLET))
-            {
-                closeClientConnection(client.getFd());
-                return false;
-            }
         }
+
         return true;
     }
+
     void closeClientConnection(int fd)
     {
         m_reactor.remove(fd);
         m_clients.erase(fd);
     }
 
-    [[nodiscard]] std::string getIp() const { return m_ip; }
+    [[nodiscard]] std::string_view getIp() const { return m_config.ip; }
 
-    [[nodiscard]] int getPort() const { return m_port; }
+    [[nodiscard]] int getPort() const { return m_config.port; }
 
     [[nodiscard]] int get() const { return m_socket.get(); }
 
 private:
+    void discardExcessConnection()
+    {
+        // Release the reserved slot
+        m_spare_fd = FileDescriptor();
+
+        // Accept into the opened slot
+        int discarded_fd = ::accept4(m_socket.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (discarded_fd >= 0)
+        {
+            // Close immediately to emit a FIN/RST to the peer and vacate the listen queue
+            ::close(discarded_fd);
+        }
+
+        // Re-reserve the slot for subsequent bursts
+        int new_spare = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (new_spare >= 0)
+        {
+            m_spare_fd = FileDescriptor(new_spare);
+        }
+        else
+        {
+            std::cerr << "Failed to reallocate reserve file descriptor" << std::endl;
+        }
+    }
+
     static void processFrames(network::Connection &client)
     {
         auto &buf = client.getReadBuffer();
@@ -215,7 +266,7 @@ private:
         {
             if (pos > 0)
             {
-                std::cout << std::format("Message received: {}", buf.substr(0, pos)) << std::endl;
+                std::cout << std::format("Message received: {}\n", buf.substr(0, pos));
                 client.queueWrite(buf.substr(0, pos) + '\0');
             }
             buf.erase(0, pos + 1);
@@ -281,11 +332,10 @@ private:
     }
 
 private:
-    static constexpr int MAX_CONNECTIONS{10};
+    ServerConfig m_config;
     FileDescriptor m_socket;
-    std::string m_ip;
+    FileDescriptor m_spare_fd; // spare file descriptor to handle EMFILE/ENFILE errors
     std::unordered_map<int, network::Connection> m_clients;
-    int m_port;
     network::EpollReactor &m_reactor;
 };
 
