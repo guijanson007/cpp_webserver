@@ -15,7 +15,7 @@
 ServerConfig parseArguments(int argc, char *argv[])
 {
     // Start with default values
-    ServerConfig config{"0.0.0.0", 8080, 10, 10'000};
+    ServerConfig config{};
 
     for (int i = 1; i < argc; ++i)
     {

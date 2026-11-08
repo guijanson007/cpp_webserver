@@ -32,7 +32,7 @@
 class Server
 {
 public:
-    Server(ServerConfig config, network::EpollReactor &reactor) : m_config(config), m_reactor(reactor)
+    Server(ServerConfig config, network::EpollReactor &reactor) : m_config(std::move(config)), m_reactor(reactor)
     {
         m_clients.reserve(config.maxConnections);
     }
@@ -100,13 +100,12 @@ public:
         while (true)
         {
             fd_temp = ::accept4(m_socket.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
-            network::Connection new_client(fd_temp);
             if (fd_temp < 0)
             {
 
                 if (errno == EMFILE || errno == ENFILE)
                 {
-                    std::cerr << "Process or system FD limit exhausted. Discarding incoming client." << std::endl;
+                    std::cerr << "Process or system FD limit exhausted. Discarding incoming client.\n";
                     discardExcessConnection();
                     return;
                 }
@@ -129,7 +128,9 @@ public:
             }
             else // successfully accepted a new connection
             {
-                if (m_clients.size() == m_config.maxConnections)
+                network::Connection new_client(fd_temp);
+
+                if (static_cast<int>(m_clients.size()) >= m_config.maxConnections)
                 {
                     std::cerr << "Max connections reached. Closing the new connection." << std::endl;
                     new_client.close();
@@ -142,7 +143,6 @@ public:
                 {
                     return; // let the client socket be closed by the destructor of new_client
                 }
-                std::cout << std::format("Connection accepted: {}", std::to_string(fd_temp)) << std::endl;
                 m_clients.insert({fd_temp, std::move(new_client)});
             }
         }
@@ -155,12 +155,9 @@ public:
         std::string &write_buffer = client.getWriteBuffer();
         if (write_buffer.empty())
         {
-            // If the peer already closed their write end (our read end), and
-            // our write buffer is fully drained, teardown the connection.
             if (client.isReadClosed())
             {
                 closeClientConnection(client.getFd());
-                return true;
             }
             return true;
         }
@@ -175,43 +172,55 @@ public:
 
         if (result == SocketIoResult::Again)
         {
-            // Register EPOLLOUT. If read side is closed, do NOT register EPOLLIN.
-            uint32_t events = EPOLLOUT | EPOLLET;
-            if (!client.isReadClosed())
+            // Only call modify if we are NOT already armed for EPOLLOUT
+            if (!client.isWaitingForWrite())
             {
-                events |= EPOLLIN;
-            }
+                uint32_t events = EPOLLOUT | EPOLLET;
+                if (!client.isReadClosed())
+                {
+                    events |= EPOLLIN;
+                }
 
-            if (!m_reactor.modify(client.getFd(), events))
-            {
-                closeClientConnection(client.getFd());
-                return false;
-            }
+                if (!m_reactor.modify(client.getFd(), events))
+                {
+                    closeClientConnection(client.getFd());
+                    return false;
+                }
 
-            client.setWaitingForWrite(true);
+                client.setWaitingForWrite(true);
+            }
             return true;
         }
 
         if (result == SocketIoResult::Ok)
         {
-            client.setWaitingForWrite(false);
+            // Only modify epoll if we PREVIOUSLY armed EPOLLOUT
+            if (client.isWaitingForWrite())
+            {
+                client.setWaitingForWrite(false);
 
-            // If the read channel is closed, draining all writes means we are done.
-            if (client.isReadClosed())
+                if (client.isReadClosed())
+                {
+                    closeClientConnection(client.getFd());
+                    return true;
+                }
+
+                if (!m_reactor.modify(client.getFd(), EPOLLIN | EPOLLET))
+                {
+                    closeClientConnection(client.getFd());
+                    return false;
+                }
+            }
+            else if (client.isReadClosed())
             {
                 closeClientConnection(client.getFd());
                 return true;
             }
-
-            // Restore to read-only monitoring
-            if (!m_reactor.modify(client.getFd(), EPOLLIN | EPOLLET))
-            {
-                closeClientConnection(client.getFd());
-                return false;
-            }
         }
+
         return true;
     }
+
     void closeClientConnection(int fd)
     {
         m_reactor.remove(fd);
@@ -257,7 +266,7 @@ private:
         {
             if (pos > 0)
             {
-                std::cout << std::format("Message received: {}", buf.substr(0, pos)) << std::endl;
+                std::cout << std::format("Message received: {}\n", buf.substr(0, pos));
                 client.queueWrite(buf.substr(0, pos) + '\0');
             }
             buf.erase(0, pos + 1);
