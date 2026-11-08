@@ -9,8 +9,10 @@
 #include <arpa/inet.h>
 #include <asm-generic/socket.h>
 #include <cerrno>
+#include <common/FileDescriptor.h>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <format>
 #include <iostream>
 #include <netinet/in.h>
@@ -20,11 +22,11 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include "network/SocketIo.h"
-
-#include <common/FileDescriptor.h>
+#include <unordered_map>
+#include <utility>
 #include "network/Connection.h"
 #include "network/EpollReactor.h"
+#include "network/SocketIo.h"
 #include "server/ServerConfig.h"
 
 class Server
@@ -41,6 +43,13 @@ public:
     void start()
     {
         struct sockaddr_in s_addr{};
+
+        int spare = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (spare < 0)
+        {
+            throw std::runtime_error("Failed to allocate reserve file descriptor");
+        }
+        m_spare_fd = FileDescriptor(spare);
 
         int temp_socket = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
         if (temp_socket < 0)
@@ -94,6 +103,14 @@ public:
             network::Connection new_client(fd_temp);
             if (fd_temp < 0)
             {
+
+                if (errno == EMFILE || errno == ENFILE)
+                {
+                    std::cerr << "Process or system FD limit exhausted. Discarding incoming client." << std::endl;
+                    discardExcessConnection();
+                    return;
+                }
+
                 if (errno == EAGAIN)
                 {
                     return; // no more connections to accept
@@ -101,7 +118,7 @@ public:
 
                 if (errno != EINTR)
                 {
-                    std::cout << std::format("Failed to accept connection: {}", std::strerror(errno)) << std::endl;
+                    std::cerr << std::format("Failed to accept connection: {}", std::strerror(errno)) << std::endl;
                     return;
                 }
                 else
@@ -114,7 +131,7 @@ public:
             {
                 if (m_clients.size() == m_config.maxConnections)
                 {
-                    std::cout << "Max connections reached. Closing the new connection." << std::endl;
+                    std::cerr << "Max connections reached. Closing the new connection." << std::endl;
                     new_client.close();
                     continue; // keep draining the accept queue
                 }
@@ -208,6 +225,31 @@ public:
     [[nodiscard]] int get() const { return m_socket.get(); }
 
 private:
+    void discardExcessConnection()
+    {
+        // Release the reserved slot
+        m_spare_fd = FileDescriptor();
+
+        // Accept into the opened slot
+        int discarded_fd = ::accept4(m_socket.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (discarded_fd >= 0)
+        {
+            // Close immediately to emit a FIN/RST to the peer and vacate the listen queue
+            ::close(discarded_fd);
+        }
+
+        // Re-reserve the slot for subsequent bursts
+        int new_spare = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (new_spare >= 0)
+        {
+            m_spare_fd = FileDescriptor(new_spare);
+        }
+        else
+        {
+            std::cerr << "Failed to reallocate reserve file descriptor" << std::endl;
+        }
+    }
+
     static void processFrames(network::Connection &client)
     {
         auto &buf = client.getReadBuffer();
@@ -283,6 +325,7 @@ private:
 private:
     ServerConfig m_config;
     FileDescriptor m_socket;
+    FileDescriptor m_spare_fd; // spare file descriptor to handle EMFILE/ENFILE errors
     std::unordered_map<int, network::Connection> m_clients;
     network::EpollReactor &m_reactor;
 };
