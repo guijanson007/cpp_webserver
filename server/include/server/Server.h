@@ -25,15 +25,16 @@
 #include <common/FileDescriptor.h>
 #include "network/Connection.h"
 #include "network/EpollReactor.h"
+#include "server/ServerConfig.h"
 
 class Server
 {
 public:
-    Server(std::string ip, int port, network::EpollReactor &reactor)
-        : m_ip(std::move(ip)), m_port(port), m_reactor(reactor)
+    Server(ServerConfig config, network::EpollReactor &reactor) : m_config(config), m_reactor(reactor)
     {
-        m_clients.reserve(MAX_CONNECTIONS);
+        m_clients.reserve(config.maxConnections);
     }
+
     Server(const Server &) = delete;
     Server &operator=(const Server &) = delete;
 
@@ -51,10 +52,10 @@ public:
 
         std::memset(&s_addr, 0, sizeof(s_addr));
         s_addr.sin_family = AF_INET;
-        s_addr.sin_port = ::htons(m_port);
+        s_addr.sin_port = ::htons(m_config.port);
 
         // s_addr.sin_addr.s_addr = INADDR_ANY;
-        if (1 != ::inet_pton(AF_INET, m_ip.c_str(), &s_addr.sin_addr))
+        if (1 != ::inet_pton(AF_INET, m_config.ip.c_str(), &s_addr.sin_addr))
         {
             throw std::runtime_error("Invalid IP address");
         }
@@ -70,8 +71,7 @@ public:
             throw std::runtime_error("Failed to bind socket");
         }
 
-        // backlog size is set to 1000 times the max connections
-        if (0 > ::listen(m_socket.get(), MAX_CONNECTIONS * 1000))
+        if (0 > ::listen(m_socket.get(), m_config.backlogSize))
         {
             throw std::runtime_error("Failed to listen on socket");
         }
@@ -112,7 +112,7 @@ public:
             }
             else // successfully accepted a new connection
             {
-                if (m_clients.size() == MAX_CONNECTIONS)
+                if (m_clients.size() == m_config.maxConnections)
                 {
                     std::cout << "Max connections reached. Closing the new connection." << std::endl;
                     new_client.close();
@@ -201,9 +201,9 @@ public:
         m_clients.erase(fd);
     }
 
-    [[nodiscard]] std::string getIp() const { return m_ip; }
+    [[nodiscard]] std::string_view getIp() const { return m_config.ip; }
 
-    [[nodiscard]] int getPort() const { return m_port; }
+    [[nodiscard]] int getPort() const { return m_config.port; }
 
     [[nodiscard]] int get() const { return m_socket.get(); }
 
@@ -281,11 +281,9 @@ private:
     }
 
 private:
-    static constexpr int MAX_CONNECTIONS{10};
+    ServerConfig m_config;
     FileDescriptor m_socket;
-    std::string m_ip;
     std::unordered_map<int, network::Connection> m_clients;
-    int m_port;
     network::EpollReactor &m_reactor;
 };
 

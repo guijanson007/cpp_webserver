@@ -16,7 +16,7 @@ pass() { echo "PASS: $*"; }
 [[ -x "$SERVER_BIN" ]] || fail "server binary not found: $SERVER_BIN (build first)"
 command -v ss >/dev/null || fail "'ss' (iproute2) is required"
 
-"$SERVER_BIN" >/dev/null 2>&1 &
+"$SERVER_BIN" --max-connections "$LIMIT" >/dev/null 2>&1 &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null' EXIT
 sleep 0.5

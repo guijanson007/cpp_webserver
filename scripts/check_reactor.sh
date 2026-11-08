@@ -50,13 +50,17 @@ close_clients() {
     FDS=()
 }
 
-accepted_count() { grep -c "Connection accepted" "$LOG"; }
+command -v ss >/dev/null || fail "ss (iproute2) is required"
+# Connections the kernel shows as established on the server side. Clients stay open
+# until close_clients, so this equals the number accepted so far. Independent of
+# server logging and stdout buffering.
+accepted_count() { ss -Htn state established "( sport = :$PORT )" | wc -l; }
 alive() { kill -0 "$SERVER_PID" 2>/dev/null; }
 
 # ---------------------------------------------------------------- 1. double close
 if (( HAVE_STRACE )); then
     echo "[1/3] strace: looking for double close()"
-    strace -f -o "$STRACE_LOG" -e trace=close,accept4,epoll_ctl "$SERVER_BIN" >"$LOG" 2>&1 &
+    strace -f -o "$STRACE_LOG" -e trace=close,accept4,epoll_ctl "$SERVER_BIN" --max-connections 10 >"$LOG" 2>&1 &
     WRAPPER_PID=$!
     sleep 1
     # The traced server is the child of strace.
@@ -86,7 +90,7 @@ fi
 
 # ---------------------------------------------------------------- 2. SIGSTOP / SIGCONT
 echo "[2/3] SIGSTOP/SIGCONT"
-"$SERVER_BIN" >"$LOG" 2>&1 &
+"$SERVER_BIN" --max-connections 10 >"$LOG" 2>&1 &
 SERVER_PID=$!
 sleep 0.5
 alive || fail "server did not start (port $PORT in use?)"
@@ -102,13 +106,13 @@ sleep 1
 
 alive || fail "server died after SIGSTOP/SIGCONT"
 n=$(accepted_count)
-(( n == 2 )) || fail "expected 2 connections accepted after SIGCONT, log shows $n"
+(( n == 2 )) || fail "expected 2 connections accepted after SIGCONT, got $n"
 pass "server survived SIGSTOP/SIGCONT and accepted the queued clients"
 
 open_client || fail "could not connect after SIGCONT"
 sleep 0.5
 n=$(accepted_count)
-(( n == 3 )) || fail "expected a fresh connection to be accepted, log shows $n"
+(( n == 3 )) || fail "expected a fresh connection to be accepted, got $n"
 pass "server still accepts new clients after SIGCONT"
 
 # ---------------------------------------------------------------- 3. ptrace attach/detach
@@ -121,7 +125,7 @@ if (( HAVE_STRACE )); then
     open_client || fail "could not connect after strace detach"
     sleep 0.5
     n=$(accepted_count)
-    (( n == 4 )) || fail "expected 4 accepted connections after detach, log shows $n"
+    (( n == 4 )) || fail "expected 4 accepted connections after detach, got $n"
     pass "server survived strace attach/detach and still accepts clients"
 else
     skip "[3/3] strace not installed"
