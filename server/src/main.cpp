@@ -62,14 +62,10 @@ int main(int argc, char *argv[])
     }
 
     Server server(config, epollReactor);
-    try
+
+    if (auto result = server.start(); !result)
     {
-        server.start();
-    }
-    catch (const std::exception &e)
-    {
-        // Handle exception
-        std::cerr << std::format("{}", e.what()) << std::endl;
+        std::cerr << std::format("Failed to start server: {}", result.error().message()) << std::endl;
         return EXIT_FAILURE;
     }
 

@@ -99,21 +99,33 @@ Current code is flatter; reorganise during M1/M2. Actual files today:
 
 ```
 common/include/common/FileDescriptor.h   RAII, move-only fd
+common/include/common/Error.h            wraps std::error_code; Error::from_errno()
+common/include/common/Result.h           Result<T, E = Error> and Result<void, E> (std::variant / optional)
 server/include/network/EpollReactor.h    epoll fd + fd -> handler table + run()
-server/include/network/Connection.h      client fd + read buffer
+server/include/network/SocketIo.h        readAllAvailable / writeSome over Result
+server/include/network/Connection.h      client fd + read/write buffers
 server/include/server/Server.h           listener, accept loop, client table, clientCallback
 server/src/main.cpp                      wiring only
-scripts/check_connection_limit.sh        WEB-1 check
-scripts/check_reactor.sh                 WEB-2 check (strace double close, SIGSTOP/SIGCONT)
+tests/                                   GoogleTest (FetchContent): error, result, socketio tests
+scripts/check_*.sh                       WEB-1..WEB-4 checks (see Workflow conventions)
 docs/tickets/WEB-<n>.md                  tickets from /next_task
 ```
 
-## Current architecture (after WEB-4)
+## Current architecture (after WEB-5)
 
 - `EpollReactor` is a dumb dispatcher: `add(fd, events, handler)`, `modify`, `remove`,
-  `run()` (one `epoll_wait` pass, returns false on fatal error). Handlers are
+  `run()` (one `epoll_wait` pass). All four return `Result<void>`. Handlers are
   `std::function<void(int fd, uint32_t events)>`. `run()` copies the handler before calling it, so a
   handler may `remove()` itself. It knows nothing about sockets or protocols.
+- Errors: `Result<T, Error>` (`common/Result.h`) on I/O paths; `Error` wraps a
+  `std::error_code`, build it with `Error::from_errno(errno)` at the failure site
+  (`Error(int)` is explicit). `Result<T, E>` rejects `T == E` and `void` misuse with
+  `requires`. `Server::start()` returns `Result<void>`; `main` prints the error and exits
+  (no exceptions). Expected outcomes are success values, not errors:
+  `SocketIo::readAllAvailable` returns `Result<ReadOutcome>` (`bytes_read`,
+  `ConnectionState::Open|ClosedByPeer`; drains until `EAGAIN` or EOF) and
+  `SocketIo::writeSome` returns `Result<size_t>` (bytes sent; a non-empty buffer afterwards
+  means the socket is full, so `flush()` arms `EPOLLOUT`).
 - `Server` owns the listening socket and `unordered_map<int, Connection>`. The listener
   is level-triggered; clients are `EPOLLIN | EPOLLET` and are drained until `EAGAIN`.
   `accept()` loops until `EAGAIN`, sheds connections over the cap with `continue`. On
@@ -131,11 +143,14 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
-  WEB-4 (done, PR open). Next: M1 cleanup ticket, then M2 (HTTP parser).
+  WEB-5 (done: `Result`/`Error`, GoogleTest, `SocketIo` tests). Next: M2 (incremental
+  HTTP parser), or a small M1 leftovers ticket first (see Open).
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
-  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion). All pass on `web-4`.
+  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion). All pass on `web-5`.
   Scripts count connections with `ss`, not server logs. Pass `--max-connections` explicitly.
+- Unit tests: `ctest --test-dir build --output-on-failure` (26 tests on `web-5`). Add a
+  test with every new parser/router/buffer unit; `SocketIo` tests use `socketpair`.
 
 ## Build
 
@@ -165,22 +180,30 @@ flags, `EMFILE`/`ENFILE` busy loop (spare fd), `explicit Connection(int)`, `Conn
 built only after a successful accept, per-accept logging removed, `check_reactor.sh`
 no longer depends on server logs. 10k idle connections verified by `check_scale.sh`.
 
+Fixed (WEB-5): `Result<T, Error>` and `Error` with concept constraints, `Server::start`
+and `EpollReactor` return `Result<void>` (no startup exceptions), EOF/EAGAIN as success
+values via `ReadOutcome`, `writeSome` erases once, `flush()` only calls `modify()` on a
+state change, listener back to level-triggered, GoogleTest scaffolding (26 tests),
+`check_scale.sh` helper functions repaired.
+
 Open:
 
 - Argument parsing: `std::stoi` accepts trailing garbage and there are no range checks
   for port, cap or backlog.
 - `EMFILE` message prints with `endl` on every discard (rate-limit or drop).
 - `MAX_EVENTS` is 10'000, a guess. Settle by profiling.
-- Leftover includes (`<asm-generic/socket.h>` in `Server.h`), unused `getFd()` on the
-  reactor; `accept4` is still called directly in `Server`.
+- Leftover include (`<asm-generic/socket.h>` in `Server.h`); `accept4` is still called
+  directly in `Server` (outside the wrapper layer).
+- `Result` is not `[[nodiscard]]` (callers use `static_cast<void>(flush(...))`);
+  `value_or` copies and has no rvalue overload; `error()` on a successful `Result<void>`
+  is undefined behavior; `Error(errno != 0 ? errno : EIO)` fallbacks after `modify()`.
+- `ReadOutcome::bytes_read` is unused by the caller. Untested `SocketIo` paths:
+  `ECONNRESET` on read, the `EINTR` retry, `send` returning 0.
 - Wire protocol (NUL-padded frames) disappears once HTTP lands.
-- `flush()` calls `modify()` on every successful flush, and again on every `EAGAIN` even
-  when `EPOLLOUT` is already armed (seen with `strace -e epoll_ctl`). Only call it on a
-  state change (`isWaitingForWrite()`).
 - `processFrames` does `buf.erase(0, pos + 1)` per frame: quadratic on big bursts
   (measured: 20k frames 0.37 s, 40k 0.53 s, 80k 3.39 s). Profiling candidate: parse with
   an offset and compact once.
-- `readSome` drains until `EAGAIN` with no cap, so one fast sender can starve the other
+- `readAllAvailable` drains until `EAGAIN` with no cap, so one fast sender can starve the other
   clients and grow the read buffer without bound. Memory is fixed by the M2 size limits
   (413/431), not by a read cap.
 - **Idea (roadmap, not built):** bounded reads per wakeup plus a ready queue so an

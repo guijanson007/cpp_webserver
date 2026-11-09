@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include "common/FileDescriptor.h"
+#include "common/Result.h"
 
 namespace network
 {
@@ -31,7 +32,7 @@ namespace network
         EpollReactor &operator=(const EpollReactor &) = delete;
         ~EpollReactor() = default;
 
-        bool add(int fd, uint32_t events, std::function<void(int, uint32_t)> handler)
+        Result<void> add(int fd, uint32_t events, std::function<void(int, uint32_t)> handler)
         {
             struct epoll_event event{};
             event.data.fd = fd;
@@ -40,13 +41,13 @@ namespace network
             if (-1 == ::epoll_ctl(m_epollFd.get(), EPOLL_CTL_ADD, fd, &event))
             {
                 std::cerr << "Failed to add file descriptor to epoll instance: " << strerror(errno) << std::endl;
-                return false;
+                return Error::from_errno(errno);
             }
             m_handlers[fd] = std::move(handler);
-            return true;
+            return {};
         }
 
-        bool modify(int fd, uint32_t events)
+        Result<void> modify(int fd, uint32_t events)
         {
             struct epoll_event event{};
             event.data.fd = fd;
@@ -55,24 +56,24 @@ namespace network
             if (-1 == ::epoll_ctl(m_epollFd.get(), EPOLL_CTL_MOD, fd, &event))
             {
                 std::cerr << "Failed to modify file descriptor in epoll instance: " << strerror(errno) << std::endl;
-                return false;
+                return Error::from_errno(errno);
             }
-            return true;
+            return {};
         }
 
-        bool remove(int fd)
+        Result<void> remove(int fd)
         {
             if (-1 == ::epoll_ctl(m_epollFd.get(), EPOLL_CTL_DEL, fd, nullptr))
             {
                 std::cerr << "Failed to remove file descriptor from epoll instance: " << strerror(errno) << std::endl;
                 m_handlers.erase(fd);
-                return false;
+                return Error::from_errno(errno);
             }
             m_handlers.erase(fd);
-            return true;
+            return {};
         }
 
-        bool run()
+        Result<void> run()
         {
             int nfds{-1};
             do
@@ -85,7 +86,7 @@ namespace network
                 if (errno != EINTR)
                 {
                     std::cerr << "Failed to wait for events: " << strerror(errno) << std::endl;
-                    return false;
+                    return Error::from_errno(errno);
                 }
             } while (errno == EINTR);
 
@@ -100,7 +101,7 @@ namespace network
 
                 handler(client_fd, m_events[n].events); // Call the handler for this fd
             }
-            return true;
+            return {};
         }
 
     private:
