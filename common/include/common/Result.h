@@ -42,6 +42,11 @@ public:
         return std::holds_alternative<T>(m_data) ? std::get<T>(m_data) : default_value;
     }
 
+    [[nodiscard]] constexpr T value_or(T &&default_value) const
+    {
+        return std::holds_alternative<T>(m_data) ? std::get<T>(m_data) : std::move(default_value);
+    }
+
 private:
     std::variant<T, E> m_data;
 };
