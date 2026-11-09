@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include "common/FileDescriptor.h"
+#include "common/Result.h"
 
 namespace network
 {
@@ -31,7 +32,7 @@ namespace network
         EpollReactor &operator=(const EpollReactor &) = delete;
         ~EpollReactor() = default;
 
-        bool add(int fd, uint32_t events, std::function<void(int, uint32_t)> handler)
+        Result<void> add(int fd, uint32_t events, std::function<void(int, uint32_t)> handler)
         {
             struct epoll_event event{};
             event.data.fd = fd;
@@ -40,10 +41,10 @@ namespace network
             if (-1 == ::epoll_ctl(m_epollFd.get(), EPOLL_CTL_ADD, fd, &event))
             {
                 std::cerr << "Failed to add file descriptor to epoll instance: " << strerror(errno) << std::endl;
-                return false;
+                return Error::from_errno(errno);
             }
             m_handlers[fd] = std::move(handler);
-            return true;
+            return {};
         }
 
         bool modify(int fd, uint32_t events)

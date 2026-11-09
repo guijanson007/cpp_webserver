@@ -49,7 +49,7 @@ namespace network
                 }
 
                 // Fatal socket error
-                return {errno};
+                return Error::from_errno(errno);
             }
             return {};
         }
@@ -90,7 +90,7 @@ namespace network
                     {
                         buffer.erase(0, total_sent);
                     }
-                    return {errno};
+                    return Error::from_errno(errno);
                 }
 
                 // r == 0: Typically shouldn't occur on non-zero send, but treat as closed/error

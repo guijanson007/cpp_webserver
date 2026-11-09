@@ -7,7 +7,9 @@ class Error
 {
 public:
     explicit Error(std::error_code error_code) : m_error_code(error_code) {}
-    Error(int error_number) : m_error_code(error_number, std::generic_category()) {}
+    explicit Error(int error_number) : m_error_code(error_number, std::generic_category()) {}
+
+    static Error from_errno(int error_number) { return Error(error_number); }
 
     [[nodiscard]] int code() const { return m_error_code.value(); }
 

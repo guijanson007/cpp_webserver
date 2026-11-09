@@ -17,7 +17,6 @@
 #include <format>
 #include <iostream>
 #include <netinet/in.h>
-#include <stdexcept>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -48,14 +47,14 @@ public:
         int spare = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (spare < 0)
         {
-            return {errno};
+            return Error::from_errno(errno);
         }
         m_spare_fd = FileDescriptor(spare);
 
         int temp_socket = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
         if (temp_socket < 0)
         {
-            return {errno};
+            return Error::from_errno(errno);
         }
 
         m_socket = FileDescriptor(temp_socket);
@@ -74,26 +73,24 @@ public:
         // set socket options to allow address reuse
         if (0 > ::setsockopt(m_socket.get(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
         {
-            return {errno};
+            return Error::from_errno(errno);
         }
 
         if (0 > ::bind(m_socket.get(), reinterpret_cast<sockaddr *>(&s_addr), sizeof(s_addr)))
         {
-            return {errno};
+            return Error::from_errno(errno);
         }
 
         if (0 > ::listen(m_socket.get(), m_config.backlogSize))
         {
-            return {errno};
+            return Error::from_errno(errno);
         }
 
         // register the server socket with the epoll reactor
         uint32_t events = EPOLLIN;
-        if (!m_reactor.add(m_socket.get(), events, [this, events](int fd, uint32_t events_in) { this->accept(); }))
-        {
-            return Error(errno != 0 ? errno : EIO);
-        }
-        return {};
+        Result<void> result =
+                m_reactor.add(m_socket.get(), events, [this, events](int fd, uint32_t events_in) { this->accept(); });
+        return result;
     }
 
     void accept()
@@ -312,6 +309,9 @@ private:
         {
             auto &buf = client.getReadBuffer();
             Result<void> result = SocketIo::readSome(client_fd, buf);
+
+            // Parse any messages drained into buf before handling EOF/error
+            processFrames(client);
 
             if (!result)
             {

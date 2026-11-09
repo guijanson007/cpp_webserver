@@ -1,10 +1,20 @@
 #pragma once
 
 #include <optional>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include "common/Error.h"
 
-template<typename T, typename E = Error>
+template<typename T>
+concept ValidValueType = (!std::is_void_v<T>) && std::is_nothrow_move_constructible_v<T>;
+
+template<typename E>
+concept ValidErrorType = std::is_nothrow_move_constructible_v<E>;
+
+// Primary template: T is non-void and distinct from E
+template<typename T, ValidErrorType E = Error>
+    requires(std::is_void_v<T> || (ValidValueType<T> && !std::is_same_v<T, E>) )
 class Result
 {
 public:
@@ -12,6 +22,7 @@ public:
         : m_data(std::in_place_type<T>, std::move(value))
     {
     }
+
     constexpr Result(E error) noexcept(std::is_nothrow_move_constructible_v<E>)
         : m_data(std::in_place_type<E>, std::move(error))
     {
@@ -25,6 +36,7 @@ public:
     [[nodiscard]] constexpr const E &error() const & { return std::get<E>(m_data); }
     [[nodiscard]] constexpr E &error() & { return std::get<E>(m_data); }
     [[nodiscard]] constexpr E &&error() && { return std::get<E>(std::move(m_data)); }
+
     [[nodiscard]] constexpr T value_or(const T &default_value) const
     {
         return std::holds_alternative<T>(m_data) ? std::get<T>(m_data) : default_value;
@@ -34,7 +46,8 @@ private:
     std::variant<T, E> m_data;
 };
 
-template<typename E>
+template<ValidErrorType E>
+    requires(!std::is_same_v<void, E>)
 class Result<void, E>
 {
 public:
