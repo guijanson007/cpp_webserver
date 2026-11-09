@@ -5,8 +5,9 @@ resume project and a vehicle for learning modern C++20. The goal is a finished,
 tested and benchmarked server where every design decision is backed by profiling data.
 
 > **Status: work in progress.** The networking core (reactor, non-blocking I/O, write
-> path, connection limits, error handling) is done. The HTTP layer is not built yet, so
-> the server currently speaks a placeholder NUL-delimited echo protocol, not HTTP.
+> path, connection limits, error handling) is done, and the HTTP request-head parser is
+> written and unit-tested. The parser is not wired into the server yet, so the server
+> still speaks a placeholder NUL-delimited echo protocol, not HTTP.
 > See [Progress](#progress).
 
 ## Platform and design decisions
@@ -50,18 +51,27 @@ tested and benchmarked server where every design decision is backed by profiling
                  |  SocketIo                     |  readAllAvailable / writeSome
                  |  (the only raw read/send)     |  return Result<...>
                  +-------------------------------+
+
+  Not wired in yet (pure functions over bytes, no sockets):
+
+                 +-------------------------------+
+  read buffer -> |  http::parse(buffer, limits)  |  -> Done{Request, consumed} | NeedMore
+                 |  (http/Parser.h, Request.h)   |     | ParseError (400/414/431/501/505)
+                 +-------------------------------+
 ```
 
 ### Components
 
 | Component | Location | Role |
-|---|---|---|
+| --- | --- | --- |
 | `FileDescriptor` | `common/include/common/` | RAII, move-only owner of a file descriptor. |
 | `Error` | `common/include/common/` | Wraps `std::error_code`. Build it with `Error::from_errno(errno)`. |
 | `Result<T, E>` | `common/include/common/` | Success-or-error type (C++20 stand-in for `std::expected`). Also `Result<void>`. |
 | `EpollReactor` | `server/include/network/` | Dumb dispatcher. `run()` does one `epoll_wait` pass and calls the registered handler. A handler may remove itself safely. |
 | `SocketIo` | `server/include/network/` | Non-blocking read and write wrappers. EOF and `EAGAIN` are success values, not errors. |
 | `Connection` | `server/include/network/` | Client fd plus read and write buffers. Closing a connection closes its fd through the destructor. |
+| `http::parse` | `server/include/http/Parser.h` | Stateless, incremental request-head parser. Returns `Done` (a `Request` plus `consumed_bytes`), `NeedMore`, or a `ParseError`. Not wired into `Server` yet. |
+| `Request` | `server/include/http/Request.h` | `string_view`s into the read buffer (method, target, version, raw headers) with a case-insensitive `getHeaderValue()`. Also `SizeLimits`. |
 | `Server` | `server/include/server/` | Listener, accept loop, connection table, cap enforcement, `EMFILE` handling. |
 | `ServerConfig` | `server/include/server/` | `ip`, `port`, `maxConnections`, `backlogSize`. |
 
@@ -79,12 +89,29 @@ tested and benchmarked server where every design decision is backed by profiling
   level-triggered listener does not spin.
 - **Backlog.** Set separately with `--backlog`. The kernel caps it at `net.core.somaxconn`.
 
+### HTTP parser behaviour
+
+- **Incremental.** `NeedMore` means "append more bytes and call again". Parsing is
+  stateless and re-scans from the start, which costs O(N^2) byte-by-byte but is cheap at
+  an 8 KiB head limit. Resuming from an offset is a profiling follow-up.
+- **Zero-copy.** The `Request` holds views into the caller's buffer. They stay valid only
+  until that buffer is modified. `consumed_bytes` tells the caller how much to drop, and
+  pipelined bytes after the head are left alone.
+- **Limits.** Request line, header block and header count are capped by `SizeLimits`
+  (defaults 8192 / 8192 / 100), checked before the terminator arrives so a slow peer
+  cannot make the server buffer forever. Over-limit gives 414 or 431.
+- **Strictness (400).** Bare LF or CR, NUL bytes, obs-fold, whitespace before the colon,
+  invalid header-name tokens, duplicate `Content-Length` (request smuggling) and, for
+  HTTP/1.1, a missing `Host`. Unsupported methods give 501; a well-formed unsupported
+  `HTTP/x.y` gives 505.
+- **Not parsed yet.** Request bodies (`Content-Length`), so `Request::body` is empty.
+
 ## Planned HTTP scope (v1)
 
 - Methods: `GET`, `HEAD`, `POST`.
-- Hand-written, incremental, resumable parser over `std::string_view` / `std::span`,
-  zero-copy where possible. No llhttp or http-parser.
-- Request-line and header size limits.
+- Hand-written, incremental parser over `std::string_view`, zero-copy. No llhttp or
+  http-parser. **Done for the request line and headers; not yet wired into the server.**
+- Request-line and header size limits (431 and 414 done; 413 comes with bodies).
 - Status codes: 400, 404, 405, 413, 431, 500.
 - `Content-Length` request bodies.
 - Keep-alive with idle timeouts.
@@ -125,12 +152,13 @@ build/server/server --port 8080 --max-connections 1000 --backlog 10000
 ```
 
 | Flag | Meaning |
-|---|---|
+| --- | --- |
 | `--port` | TCP port to listen on. |
 | `--max-connections` | Concurrent connection cap. Pass it explicitly. The built-in default is 100. |
 | `--backlog` (or `--backlog-size`) | `listen()` backlog. Default 10000. |
 
-Until the HTTP layer lands, the server echoes NUL-terminated frames:
+The HTTP parser is not connected to the server yet, so `curl` does not get a response.
+Until it is, the server echoes NUL-terminated frames:
 
 ```sh
 printf 'hello\0' | nc localhost 8080
@@ -138,15 +166,17 @@ printf 'hello\0' | nc localhost 8080
 
 ## Test
 
-Unit tests use GoogleTest and live in a single target, `common_tests`:
+Unit tests use GoogleTest and live in a single target, `common_tests` (74 tests):
 
 ```sh
 ctest --test-dir build --output-on-failure          # everything
 build/tests/common_tests --gtest_filter='SocketIo*' # one suite or test
+build/tests/common_tests --gtest_filter='Parser*'   # HTTP parser tests
 ```
 
 Add new test files to the `common_tests` source list in `tests/CMakeLists.txt`.
-`SocketIo` tests use `socketpair`, so they need no network.
+`SocketIo` tests use `socketpair`, and the parser tests are pure functions over strings,
+so none of them need the network.
 
 ### End-to-end check scripts
 
@@ -154,7 +184,7 @@ These start the server themselves. Each takes `[server-binary] [port]` and defau
 `build/server/server` and port 8080.
 
 | Script | Verifies |
-|---|---|
+| --- | --- |
 | `scripts/check_connection_limit.sh` | The connection cap is enforced and the server survives going over it. |
 | `scripts/check_reactor.sh` | Reactor behaviour (uses `strace` and `ss`). |
 | `scripts/check_write_path.sh` | Echo, RST survival, backpressure, `EPOLLOUT` armed only when needed. |
@@ -166,21 +196,21 @@ The scripts count connections with `ss`, not server logs.
 
 ```
 common/        shared utilities: FileDescriptor, Error, Result
-server/        reactor, sockets, connection handling, main
+server/        reactor, sockets, connection handling, HTTP parser (http/), main
 client/        small client (a load generator is roadmap only)
 tests/         GoogleTest unit tests
 scripts/       end-to-end check scripts
 docs/tickets/  one ticket per unit of work (WEB-<n>)
 ```
 
-Planned: `server/http/` (parser, request/response, router) and `docs/PERFORMANCE.md`.
+Planned: the rest of `server/include/http/` (response builder, router) and `docs/PERFORMANCE.md`.
 
 ## Progress
 
-### Estimated completion: 26%
+### Estimated completion: 35%
 
 ```
-[#####...............]  26%   (9 of 34 required items)
+[#######.............]  35%   (12 of 34 required items)
 ```
 
 How it is computed: the checklist below has 34 required items across milestones M1-M5.
@@ -191,6 +221,7 @@ average done item, so real progress is probably a bit lower.
 ### Built
 
 **M1: Reactor cleanup (done)**
+
 - [x] `EpollReactor` class, with epoll logic out of `main`
 - [x] `constexpr` constants instead of `#define`
 - [x] Accept crash at the connection cap fixed
@@ -199,25 +230,33 @@ average done item, so real progress is probably a bit lower.
 - [x] Configurable connection cap and backlog (`ServerConfig` and CLI flags)
 - [x] `EMFILE`/`ENFILE` handling, 10k idle connections verified
 
+**M2 (partial): HTTP core, request head (WEB-6)**
+
+- [x] Incremental request parser (`http::parse`, stateless, zero-copy, strict)
+- [x] Request-line and header parsing (`Request`, case-insensitive `getHeaderValue`)
+
 **M4 (partial): Quality foundations**
+
 - [x] GoogleTest wired in through `FetchContent`
 - [x] Unit tests for `Error`, `Result` and `SocketIo` (26 tests)
+- [x] Parser unit tests (48 tests: split at every offset, size limits, malformed input)
 
 Also done and not counted separately: `Result<T, Error>` error handling with concept
-constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, four end-to-end check scripts.
+constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, four end-to-end check scripts, 431/414
+size limits in the parser.
 
 ### Planned
 
-**M2: HTTP core (0/7)**
-- [ ] Incremental, resumable request parser
-- [ ] Request-line and header parsing
-- [ ] Size limits (413, 431)
+**M2: HTTP core (2/7 done, listed above)**
+
+- [ ] Size limits (431 and 414 done in the parser; 413 needs bodies)
 - [ ] `Content-Length` bodies
 - [ ] Response builder
-- [ ] `GET`, `HEAD`, `POST` handling
+- [ ] `GET`, `HEAD`, `POST` handling (includes wiring the parser into `Server`)
 - [ ] Status codes 400, 404, 405, 413, 431, 500
 
 **M3: Routing and static files (0/7)**
+
 - [ ] Concept-constrained router
 - [ ] Static file serving
 - [ ] MIME type table
@@ -226,8 +265,8 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, four end-to-end ch
 - [ ] Idle timeouts without a thread per connection
 - [ ] Remove the placeholder echo protocol
 
-**M4: Quality (2/8 done, the two done items are listed above)**
-- [ ] Parser unit tests
+**M4: Quality (3/8 done, the three done items are listed above)**
+
 - [ ] Router unit tests
 - [ ] Buffer unit tests
 - [ ] GitHub Actions CI (GCC and Clang)
@@ -235,6 +274,7 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, four end-to-end ch
 - [ ] clang-tidy configuration
 
 **M5: Polish (0/5)**
+
 - [ ] Architecture diagram polish and final README
 - [ ] `wrk` benchmark against Nginx serving the same static file
 - [ ] `docs/PERFORMANCE.md` with before/after tables, committed flamegraphs, CPU model and kernel
@@ -242,16 +282,21 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, four end-to-end ch
 - [ ] 10k+ concurrent keep-alive connections without crashing
 
 **M6: Optional, only after M5 ships**
+
 - [ ] `std::jthread` worker pool
 - [ ] Graceful shutdown on SIGINT/SIGTERM
 - [ ] Profile against the single-threaded server
 
 **Known cleanups (small tickets)**
+
 - [ ] Strict argument parsing (`std::stoi` accepts trailing garbage, no range checks)
 - [ ] Rate-limit the `EMFILE` log message
 - [ ] Move the direct `accept4` call behind the wrapper layer
 - [ ] Mark `Result` `[[nodiscard]]`
 - [ ] Bound reads per wakeup so one fast sender cannot starve others
+- [ ] Cap the per-connection write buffer
+- [ ] Remove the unused `HttpMethod::DELETE`
+- [ ] Warning flags on the `server` and `common` targets (only tests have them today)
 
 ### Profiling plan
 
