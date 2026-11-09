@@ -87,7 +87,7 @@ public:
         }
 
         // register the server socket with the epoll reactor
-        uint32_t events = EPOLLIN | EPOLLET; // edge-triggered read events
+        uint32_t events = EPOLLIN;
         Result<void> result = m_reactor.add(m_socket.get(), events, [this](int, uint32_t) { this->accept(); });
         return result;
     }
