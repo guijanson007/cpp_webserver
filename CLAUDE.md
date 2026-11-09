@@ -161,6 +161,16 @@ cmake --build build
 
 Needs CMake >= 4.3. Formatting: `.clang-format` in repo root.
 
+```
+build/server/server --port 8080 --max-connections 1000    # run (always pass the cap)
+ctest --test-dir build --output-on-failure                # all unit tests
+build/tests/common_tests --gtest_filter='SocketIo*'       # one suite/test (binary: common_tests)
+scripts/check_write_path.sh [server-binary] [port]        # check scripts default to build/server/server, port 8080
+```
+
+All tests live in the single `common_tests` target (`tests/CMakeLists.txt`); add new
+test files to its source list. No CI, README or Cursor/Copilot rules exist yet (M4/M5).
+
 ## Known issues (M1 backlog)
 
 Fixed (WEB-1, WEB-2): accept crash at the cap, `#define` macros, `<algorithm>`, dead
