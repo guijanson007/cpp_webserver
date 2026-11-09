@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cerrno>
+#include <cstddef>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -9,15 +11,31 @@
 
 namespace network
 {
+    enum class ConnectionState
+    {
+        Open,
+        ClosedByPeer
+    };
+
+    struct ReadOutcome
+    {
+        size_t bytes_read{0};
+        ConnectionState state{ConnectionState::Open};
+    };
+
     class SocketIo
     {
     public:
         SocketIo() = default;
         ~SocketIo() = default;
 
-        static Result<void> readSome(int fd, std::string &buffer)
+        // Drains the kernel buffer until EAGAIN or EOF.
+        // Returns the number of bytes read and whether the peer closed connection.
+        // Only returns Error on real OS failures (EBADF, ECONNRESET, etc.).
+        static Result<ReadOutcome> readAllAvailable(int fd, std::string &buffer)
         {
             char tmp[4096];
+            size_t total_read = 0;
 
             for (;;)
             {
@@ -26,41 +44,41 @@ namespace network
                 if (r > 0)
                 {
                     buffer.append(tmp, static_cast<size_t>(r));
+                    total_read += static_cast<size_t>(r);
                     continue;
                 }
 
                 if (r == 0)
                 {
-                    // Clean EOF from peer
-                    // return ENOTCONN to indicate the connection has been closed
-                    return Error(ENOTCONN);
+                    // Clean EOF: peer sent FIN
+                    return ReadOutcome{.bytes_read = total_read, .state = ConnectionState::ClosedByPeer};
                 }
 
-                // r < 0: Evaluate errno immediately
                 if (errno == EINTR)
                 {
-                    continue; // Interrupted by signal, retry
+                    continue;
                 }
 
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                 {
-                    // Fully drained the kernel receive queue under EPOLLET
-                    return Error(EAGAIN);
+                    // Fully drained - standard completion under EPOLLET
+                    return ReadOutcome{.bytes_read = total_read, .state = ConnectionState::Open};
                 }
 
-                // Fatal socket error
                 return Error::from_errno(errno);
             }
-            return {};
         }
 
-        static Result<void> writeSome(int fd, std::string &buffer)
+        // Attempts to flush as much of the buffer as the socket will accept.
+        // Erases sent bytes in place once when leaving the loop.
+        static Result<size_t> writeSome(int fd, std::string &buffer)
         {
             size_t total_sent = 0;
+            const size_t initial_size = buffer.size();
 
-            while (total_sent < buffer.size())
+            while (total_sent < initial_size)
             {
-                const ssize_t r = ::send(fd, buffer.data() + total_sent, buffer.size() - total_sent, MSG_NOSIGNAL);
+                const ssize_t r = ::send(fd, buffer.data() + total_sent, initial_size - total_sent, MSG_NOSIGNAL);
 
                 if (r > 0)
                 {
@@ -72,28 +90,24 @@ namespace network
                 {
                     if (errno == EINTR)
                     {
-                        continue; // Interrupted by signal, retry
+                        continue;
                     }
 
-                    if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    {
-                        // Remove whatever was successfully sent so far
-                        if (total_sent > 0)
-                        {
-                            buffer.erase(0, total_sent);
-                        }
-                        return Error(EAGAIN);
-                    }
-
-                    // Fatal error (EPIPE, ECONNRESET, etc.)
+                    // On partial send or drain, erase sent slice once and return
                     if (total_sent > 0)
                     {
                         buffer.erase(0, total_sent);
                     }
+
+                    if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    {
+                        return total_sent;
+                    }
+
                     return Error::from_errno(errno);
                 }
 
-                // r == 0: Typically shouldn't occur on non-zero send, but treat as closed/error
+                // r == 0 on send() with non-zero length implies connection broken
                 if (total_sent > 0)
                 {
                     buffer.erase(0, total_sent);
@@ -101,9 +115,8 @@ namespace network
                 return Error(EPIPE);
             }
 
-            // All data from the buffer was sent successfully
             buffer.clear();
-            return {};
+            return total_sent;
         }
     };
 } // namespace network
