@@ -5,23 +5,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "common/Result.h"
+
 namespace network
 {
-    enum class SocketIoResult
-    {
-        Ok,
-        Again,
-        Eof,
-        Error,
-    };
-
     class SocketIo
     {
     public:
         SocketIo() = default;
         ~SocketIo() = default;
 
-        static SocketIoResult readSome(int fd, std::string &buffer)
+        static Result<void> readSome(int fd, std::string &buffer)
         {
             char tmp[4096];
 
@@ -38,7 +32,8 @@ namespace network
                 if (r == 0)
                 {
                     // Clean EOF from peer
-                    return SocketIoResult::Eof;
+                    // return ENOTCONN to indicate the connection has been closed
+                    return Error(ENOTCONN);
                 }
 
                 // r < 0: Evaluate errno immediately
@@ -50,15 +45,16 @@ namespace network
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                 {
                     // Fully drained the kernel receive queue under EPOLLET
-                    return SocketIoResult::Again;
+                    return Error(EAGAIN);
                 }
 
                 // Fatal socket error
-                return SocketIoResult::Error;
+                return {errno};
             }
+            return {};
         }
 
-        static SocketIoResult writeSome(int fd, std::string &buffer)
+        static Result<void> writeSome(int fd, std::string &buffer)
         {
             size_t total_sent = 0;
 
@@ -86,7 +82,7 @@ namespace network
                         {
                             buffer.erase(0, total_sent);
                         }
-                        return SocketIoResult::Again;
+                        return Error(EAGAIN);
                     }
 
                     // Fatal error (EPIPE, ECONNRESET, etc.)
@@ -94,7 +90,7 @@ namespace network
                     {
                         buffer.erase(0, total_sent);
                     }
-                    return SocketIoResult::Error;
+                    return {errno};
                 }
 
                 // r == 0: Typically shouldn't occur on non-zero send, but treat as closed/error
@@ -102,12 +98,12 @@ namespace network
                 {
                     buffer.erase(0, total_sent);
                 }
-                return SocketIoResult::Error;
+                return Error(EPIPE);
             }
 
             // All data from the buffer was sent successfully
             buffer.clear();
-            return SocketIoResult::Ok;
+            return {};
         }
     };
 } // namespace network
