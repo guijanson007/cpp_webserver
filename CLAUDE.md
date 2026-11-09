@@ -104,14 +104,16 @@ common/include/common/Result.h           Result<T, E = Error> and Result<void, E
 server/include/network/EpollReactor.h    epoll fd + fd -> handler table + run()
 server/include/network/SocketIo.h        readAllAvailable / writeSome over Result
 server/include/network/Connection.h      client fd + read/write buffers
+server/include/http/Request.h            Request (string_views into the read buffer), SizeLimits, iequals
+server/include/http/Parser.h             http::parse(): stateless request-head parser, ParseError
 server/include/server/Server.h           listener, accept loop, client table, clientCallback
 server/src/main.cpp                      wiring only
-tests/                                   GoogleTest (FetchContent): error, result, socketio tests
+tests/                                   GoogleTest (FetchContent): error, result, socketio, parser tests
 scripts/check_*.sh                       WEB-1..WEB-4 checks (see Workflow conventions)
 docs/tickets/WEB-<n>.md                  tickets from /next_task
 ```
 
-## Current architecture (after WEB-5)
+## Current architecture (after WEB-6)
 
 - `EpollReactor` is a dumb dispatcher: `add(fd, events, handler)`, `modify`, `remove`,
   `run()` (one `epoll_wait` pass). All four return `Result<void>`. Handlers are
@@ -134,6 +136,14 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 - `ServerConfig` (`server/ServerConfig.h`) holds `ip`, `port`, `maxConnections` (default
   100) and `backlogSize` (default 10'000). `main` parses `--port`, `--max-connections`,
   `--backlog` into it. The kernel caps the backlog at `net.core.somaxconn`.
+- HTTP head parser (`http/Parser.h`, not wired into `Server` yet): `http::parse(std::string_view
+  buffer, const SizeLimits &) -> Result<std::variant<Done, NeedMore>, ParseError>`. Stateless: on
+  `NeedMore` the caller appends more bytes and calls again (re-scan, O(N^2) byte-by-byte, fine at
+  8 KiB). `Done` holds a `Request` (views into `buffer`, valid until the buffer is modified) and
+  `consumed_bytes`. Protocol errors are `ParseError` values (400/414/431/501/505), not `Error`.
+  Supports GET/HEAD/POST over HTTP/1.0 and 1.1; HTTP/1.1 requires `Host`. Rejects bare LF/CR, NUL,
+  obs-fold, space before colon, bad header-name tokens, duplicate `Content-Length`.
+  `Request::getHeaderValue` is case-insensitive. Bodies are not parsed yet (`body` is empty).
 - `Connection` owns its `FileDescriptor` and read buffer. Closing = `reactor.remove(fd)`
   then erase from the map (the destructor closes the fd; never call raw `close` on an
   fd a `Connection` owns).
@@ -143,14 +153,15 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
-  WEB-5 (done: `Result`/`Error`, GoogleTest, `SocketIo` tests). Next: M2 (incremental
-  HTTP parser), or a small M1 leftovers ticket first (see Open).
+  WEB-6 (done: standalone HTTP request-head parser + 48 tests). Next: a small cleanup ticket
+  (argument validation, `[[nodiscard]] Result`, warning flags) and/or M2 part 2: `Content-Length`
+  bodies and wiring the parser into `Server`.
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
-  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion). All pass on `web-5`.
+  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion). All pass on `web-6`.
   Scripts count connections with `ss`, not server logs. Pass `--max-connections` explicitly.
-- Unit tests: `ctest --test-dir build --output-on-failure` (26 tests on `web-5`). Add a
-  test with every new parser/router/buffer unit; `SocketIo` tests use `socketpair`.
+- Unit tests: `ctest --test-dir build --output-on-failure` (74 tests on `web-6`). Add a
+  test with every new parser/router/buffer unit; `SocketIo` tests use `socketpair`; parser tests are socket-free.
 
 ## Build
 
@@ -196,20 +207,32 @@ values via `ReadOutcome`, `writeSome` erases once, `flush()` only calls `modify(
 state change, listener back to level-triggered, GoogleTest scaffolding (26 tests),
 `check_scale.sh` helper functions repaired.
 
+Fixed (WEB-6): `http::parse` and `Request` (see Current architecture), `Server` constructor no
+longer reads the moved-from `config` (uses `m_config`), 48 parser tests.
+
 Open:
 
 - Argument parsing: `std::stoi` accepts trailing garbage and there are no range checks
   for port, cap or backlog.
-- `EMFILE` message prints with `endl` on every discard (rate-limit or drop).
+- `EMFILE` message prints on every discard (rate-limit or drop).
 - `MAX_EVENTS` is 10'000, a guess. Settle by profiling.
 - Leftover include (`<asm-generic/socket.h>` in `Server.h`); `accept4` is still called
   directly in `Server` (outside the wrapper layer).
 - `Result` is not `[[nodiscard]]` (callers use `static_cast<void>(flush(...))`);
-  `value_or` copies and has no rvalue overload; `error()` on a successful `Result<void>`
+  `error()` on a successful `Result<void>`
   is undefined behavior; `Error(errno != 0 ? errno : EIO)` fallbacks after `modify()`.
 - `ReadOutcome::bytes_read` is unused by the caller. Untested `SocketIo` paths:
   `ECONNRESET` on read, the `EINTR` retry, `send` returning 0.
 - Wire protocol (NUL-padded frames) disappears once HTTP lands.
+- `HttpMethod::DELETE` is in the enum but the parser never returns it (501); remove it.
+- Argument parsing review (verified): `--port 70000` binds 4464 while printing 70000,
+  `--max-connections -1` starts and sheds every client.
+- `EpollReactor` dispatches by fd number from a fetched batch: a stale event can reach a new
+  connection that reused the fd in the same batch (use a generation id in `epoll_event.data`).
+- `flush()` reads `errno` after `closeClientConnection()`; return the `Result` error from
+  `modify()` instead. The write buffer has no cap (a non-reading client grows it).
+- `EpollReactor` constructor throws outside `main`'s `try`; warning flags exist only on the
+  test target.
 - `processFrames` does `buf.erase(0, pos + 1)` per frame: quadratic on big bursts
   (measured: 20k frames 0.37 s, 40k 0.53 s, 80k 3.39 s). Profiling candidate: parse with
   an offset and compact once.
