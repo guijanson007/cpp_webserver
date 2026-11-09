@@ -15,7 +15,10 @@ include(GoogleTest)
 add_executable(common_tests
     error_test.cpp
     result_test.cpp
+    socketio_test.cpp
 )
+# SocketIo.h is header-only and lives next to the server sources.
+target_include_directories(common_tests PRIVATE ${PROJECT_SOURCE_DIR}/server/include)
 target_link_libraries(common_tests PRIVATE common GTest::gtest_main)
 target_compile_options(common_tests PRIVATE -Wall -Wextra)
 gtest_discover_tests(common_tests)
