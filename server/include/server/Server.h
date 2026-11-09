@@ -34,7 +34,7 @@ class Server
 public:
     Server(ServerConfig config, network::EpollReactor &reactor) : m_config(std::move(config)), m_reactor(reactor)
     {
-        m_clients.reserve(config.maxConnections);
+        m_clients.reserve(m_config.maxConnections);
     }
 
     Server(const Server &) = delete;
