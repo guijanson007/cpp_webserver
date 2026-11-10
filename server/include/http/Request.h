@@ -76,5 +76,47 @@ namespace http
             }
             return std::nullopt;
         }
+        [[nodiscard]] bool shouldKeepAlive() const
+        {
+            bool has_close = false;
+            bool has_keep_alive = false;
+            auto conn_header = getHeaderValue("Connection");
+
+            if (conn_header)
+            {
+                std::string_view val = *conn_header;
+                size_t start = 0;
+                while (start < val.size())
+                {
+                    size_t end = val.find(',', start);
+                    std::string_view token =
+                            (end == std::string_view::npos) ? val.substr(start) : val.substr(start, end - start);
+
+                    // Trim Optional Whitespace (OWS)
+                    while (!token.empty() && (token.front() == ' ' || token.front() == '\t'))
+                        token.remove_prefix(1);
+                    while (!token.empty() && (token.back() == ' ' || token.back() == '\t'))
+                        token.remove_suffix(1);
+
+                    if (iequals(token, "close"))
+                        has_close = true;
+                    else if (iequals(token, "keep-alive"))
+                        has_keep_alive = true;
+
+                    if (end == std::string_view::npos)
+                        break;
+                    start = end + 1;
+                }
+            }
+
+            if (version == "HTTP/1.0")
+            {
+                return has_keep_alive && !has_close;
+            }
+            else
+            {
+                return !has_close;
+            }
+        }
     };
 } // namespace http
