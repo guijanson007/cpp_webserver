@@ -5,10 +5,11 @@ resume project and a vehicle for learning modern C++20. The goal is a finished,
 tested and benchmarked server where every design decision is backed by profiling data.
 
 > **Status: work in progress.** The networking core (reactor, non-blocking I/O, write
-> path, connection limits, error handling) is done, and the HTTP request-head parser is
-> written and unit-tested. The parser is not wired into the server yet, so the server
-> still speaks a placeholder NUL-delimited echo protocol, not HTTP.
-> See [Progress](#progress).
+> path, connection limits, error handling) is done, and the server now speaks HTTP/1.1
+> request heads: it parses them, answers with a fixed `200 OK` (or a 4xx/5xx error),
+> and supports keep-alive, pipelining and `HEAD`. There is no router, no request body
+> handling and no static files yet, so every successful request gets the same
+> `Hello, World!` body. See [Progress](#progress).
 
 ## Platform and design decisions
 
@@ -39,25 +40,21 @@ tested and benchmarked server where every design decision is backed by profiling
                                  | handler(fd, events)
                  +---------------v---------------+
                  |  Server                       |  accept loop, connection table,
-                 |  unordered_map<fd, Connection>|  connection cap, EMFILE handling
-                 +---------------+---------------+
-                                 |
-                 +---------------v---------------+
-                 |  Connection                   |  owns FileDescriptor,
-                 |  read buffer / write buffer   |  per-connection buffers
-                 +---------------+---------------+
-                                 |
-                 +---------------v---------------+
-                 |  SocketIo                     |  readAllAvailable / writeSome
-                 |  (the only raw read/send)     |  return Result<...>
-                 +-------------------------------+
-
-  Not wired in yet (pure functions over bytes, no sockets):
-
-                 +-------------------------------+
-  read buffer -> |  http::parse(buffer, limits)  |  -> Done{Request, consumed} | NeedMore
-                 |  (http/Parser.h, Request.h)   |     | ParseError (400/414/431/501/505)
-                 +-------------------------------+
+                 |  unordered_map<fd, Connection>|  connection cap, EMFILE handling,
+                 |                               |  parse -> respond loop per wakeup
+                 +-------+---------------+-------+
+                         |               |
+         +---------------v-----+   +-----v---------------------------+
+         |  Connection         |   |  http:: (pure, no sockets)      |
+         |  FileDescriptor,    |   |  parse(buffer, limits)          |
+         |  read/write buffers |   |    -> Done{Request, consumed}   |
+         +---------------+-----+   |     | NeedMore | ParseError    |
+                         |         |  Request::shouldKeepAlive()     |
+         +---------------v-----+   |  Response{...}.serialize()      |
+         |  SocketIo           |   +---------------------------------+
+         |  readAllAvailable / |
+         |  writeSome (Result) |
+         +---------------------+
 ```
 
 ### Components
@@ -70,9 +67,10 @@ tested and benchmarked server where every design decision is backed by profiling
 | `EpollReactor` | `server/include/network/` | Dumb dispatcher. `run()` does one `epoll_wait` pass and calls the registered handler. A handler may remove itself safely. |
 | `SocketIo` | `server/include/network/` | Non-blocking read and write wrappers. EOF and `EAGAIN` are success values, not errors. |
 | `Connection` | `server/include/network/` | Client fd plus read and write buffers. Closing a connection closes its fd through the destructor. |
-| `http::parse` | `server/include/http/Parser.h` | Stateless, incremental request-head parser. Returns `Done` (a `Request` plus `consumed_bytes`), `NeedMore`, or a `ParseError`. Not wired into `Server` yet. |
-| `Request` | `server/include/http/Request.h` | `string_view`s into the read buffer (method, target, version, raw headers) with a case-insensitive `getHeaderValue()`. Also `SizeLimits`. |
-| `Server` | `server/include/server/` | Listener, accept loop, connection table, cap enforcement, `EMFILE` handling. |
+| `http::parse` | `server/include/http/Parser.h` | Stateless, incremental request-head parser. Returns a `std::variant<Done, NeedMore, ParseError>`. `Done` holds a `Request` plus `consumed_bytes`. |
+| `Request` | `server/include/http/Request.h` | `string_view`s into the read buffer (method, target, version, raw headers) with a case-insensitive `getHeaderValue()` and `shouldKeepAlive()`. Also `SizeLimits`. |
+| `Response` | `server/include/http/Response.h` | Status, body and extra headers. `serialize()` always emits `Content-Length`, plus `Connection: close` when asked. `StatusCode` and `statusCodeToReasonPhrase()` live here. |
+| `Server` | `server/include/server/` | Listener, accept loop, connection table, cap enforcement, `EMFILE` handling, and the per-connection parse and respond loop. |
 | `ServerConfig` | `server/include/server/` | `ip`, `port`, `maxConnections`, `backlogSize`. |
 
 ### Behaviour worth knowing
@@ -89,6 +87,23 @@ tested and benchmarked server where every design decision is backed by profiling
   level-triggered listener does not spin.
 - **Backlog.** Set separately with `--backlog`. The kernel caps it at `net.core.somaxconn`.
 
+### Request handling (WEB-7)
+
+- **Loop.** After each drain of the socket, `Server` calls `http::parse` repeatedly on the
+  read buffer. `Done` queues a response and drops the consumed bytes, `NeedMore` waits for
+  the next read, and a `ParseError` queues an error response and stops.
+- **Responses.** Every parsed request gets `200 OK` with a `text/plain` `Hello, World!`
+  body. `HEAD` gets the same headers (including `Content-Length`) and no body.
+- **Pipelining.** Several requests in one read are answered in order, and the output is
+  flushed once.
+- **Keep-alive.** `Request::shouldKeepAlive()`: HTTP/1.1 stays open unless `Connection`
+  contains `close`. HTTP/1.0 closes unless `Connection` contains `keep-alive`. `close` wins
+  over `keep-alive`. `Connection` is split on commas and compared case-insensitively. Only
+  the first `Connection` header line is looked at (see the roadmap).
+- **Errors.** A `ParseError` becomes the response status with `Connection: close`. The
+  connection is marked read-closed, so `flush()` closes it after the buffer drains, and any
+  bytes after the bad request are dropped.
+
 ### HTTP parser behaviour
 
 - **Incremental.** `NeedMore` means "append more bytes and call again". Parsing is
@@ -104,13 +119,14 @@ tested and benchmarked server where every design decision is backed by profiling
   invalid header-name tokens, duplicate `Content-Length` (request smuggling) and, for
   HTTP/1.1, a missing `Host`. Unsupported methods give 501; a well-formed unsupported
   `HTTP/x.y` gives 505.
-- **Not parsed yet.** Request bodies (`Content-Length`), so `Request::body` is empty.
+- **Not parsed yet.** Request bodies (`Content-Length`), so `Request::body` is empty. A POST
+  with a body is not supported until the next ticket.
 
 ## Planned HTTP scope (v1)
 
 - Methods: `GET`, `HEAD`, `POST`.
 - Hand-written, incremental parser over `std::string_view`, zero-copy. No llhttp or
-  http-parser. **Done for the request line and headers; not yet wired into the server.**
+  http-parser. **Done for the request line and headers, and wired into the server.**
 - Request-line and header size limits (431 and 414 done; 413 comes with bodies).
 - Status codes: 400, 404, 405, 413, 431, 500.
 - `Content-Length` request bodies.
@@ -157,26 +173,29 @@ build/server/server --port 8080 --max-connections 1000 --backlog 10000
 | `--max-connections` | Concurrent connection cap. Pass it explicitly. The built-in default is 100. |
 | `--backlog` (or `--backlog-size`) | `listen()` backlog. Default 10000. |
 
-The HTTP parser is not connected to the server yet, so `curl` does not get a response.
-Until it is, the server echoes NUL-terminated frames:
-
 ```sh
-printf 'hello\0' | nc localhost 8080
+curl -v http://localhost:8080/        # 200 OK, "Hello, World!"
+curl -I http://localhost:8080/        # same headers, no body
+printf 'FOO / HTTP/1.1\r\nHost: x\r\n\r\n' | nc localhost 8080   # 501, then the connection closes
 ```
+
+Every request currently gets the same fixed response. Routing and static files come in M3.
 
 ## Test
 
-Unit tests use GoogleTest and live in a single target, `common_tests` (74 tests):
+Unit tests use GoogleTest and live in a single target, `common_tests` (123 tests, 1 disabled
+known-gap test):
 
 ```sh
 ctest --test-dir build --output-on-failure          # everything
 build/tests/common_tests --gtest_filter='SocketIo*' # one suite or test
 build/tests/common_tests --gtest_filter='Parser*'   # HTTP parser tests
+build/tests/common_tests --gtest_filter='Response*:ReasonPhrase*:KeepAlive*'   # WEB-7 tests
 ```
 
 Add new test files to the `common_tests` source list in `tests/CMakeLists.txt`.
-`SocketIo` tests use `socketpair`, and the parser tests are pure functions over strings,
-so none of them need the network.
+`SocketIo` tests use `socketpair`, and the parser, response and keep-alive tests are pure
+functions over strings, so none of them need the network.
 
 ### End-to-end check scripts
 
@@ -187,8 +206,9 @@ These start the server themselves. Each takes `[server-binary] [port]` and defau
 | --- | --- |
 | `scripts/check_connection_limit.sh` | The connection cap is enforced and the server survives going over it. |
 | `scripts/check_reactor.sh` | Reactor behaviour (uses `strace` and `ss`). |
-| `scripts/check_write_path.sh` | Echo, RST survival, backpressure, `EPOLLOUT` armed only when needed. |
+| `scripts/check_write_path.sh` | Pipelined responses, RST survival, backpressure (100k pipelined requests, ~8 MB out), half-close flush, `EPOLLOUT` armed only when needed. |
 | `scripts/check_scale.sh` | The cap, 10k idle connections, fd exhaustion. |
+| `scripts/check_http.sh` | GET, HEAD, keep-alive, HTTP/1.0, `Connection: close`, pipelining, byte-by-byte requests, 400/414/431/501/505 followed by close, `curl`. |
 
 The scripts count connections with `ss`, not server logs.
 
@@ -203,14 +223,14 @@ scripts/       end-to-end check scripts
 docs/tickets/  one ticket per unit of work (WEB-<n>)
 ```
 
-Planned: the rest of `server/include/http/` (response builder, router) and `docs/PERFORMANCE.md`.
+Planned: the router in `server/include/http/` and `docs/PERFORMANCE.md`.
 
 ## Progress
 
-### Estimated completion: 35%
+### Estimated completion: 44%
 
 ```
-[#######.............]  35%   (12 of 34 required items)
+[#########...........]  44%   (15 of 34 required items)
 ```
 
 How it is computed: the checklist below has 34 required items across milestones M1-M5.
@@ -235,35 +255,45 @@ average done item, so real progress is probably a bit lower.
 - [x] Incremental request parser (`http::parse`, stateless, zero-copy, strict)
 - [x] Request-line and header parsing (`Request`, case-insensitive `getHeaderValue`)
 
+**M2 (partial): HTTP responses and wiring (WEB-7)**
+
+- [x] Response builder (`http::Response`, status and reason phrases, `Content-Length`)
+- [x] `GET`, `HEAD`, `POST` handling: the parser is wired into `Server`, with keep-alive,
+  pipelining and error responses (fixed `200` body; bodies and routing come later)
+
+**M3 (partial)**
+
+- [x] Placeholder echo protocol removed
+
 **M4 (partial): Quality foundations**
 
 - [x] GoogleTest wired in through `FetchContent`
 - [x] Unit tests for `Error`, `Result` and `SocketIo` (26 tests)
 - [x] Parser unit tests (48 tests: split at every offset, size limits, malformed input)
+- [x] Response and keep-alive unit tests (`ResponseTest`, `ReasonPhraseTest`, `KeepAliveTest`)
 
 Also done and not counted separately: `Result<T, Error>` error handling with concept
-constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, four end-to-end check scripts, 431/414
-size limits in the parser.
+constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, five end-to-end check scripts
+(the older ones ported to HTTP), 431/414 size limits in the parser, HTTP/1.0 and
+`Connection` token-list handling.
 
 ### Planned
 
-**M2: HTTP core (2/7 done, listed above)**
+**M2: HTTP core (4/7 done, listed above)**
 
 - [ ] Size limits (431 and 414 done in the parser; 413 needs bodies)
-- [ ] `Content-Length` bodies
-- [ ] Response builder
-- [ ] `GET`, `HEAD`, `POST` handling (includes wiring the parser into `Server`)
-- [ ] Status codes 400, 404, 405, 413, 431, 500
+- [ ] `Content-Length` bodies (next: WEB-8)
+- [ ] Status codes 400, 404, 405, 413, 431, 500 (400, 431, 414, 501, 505 are returned today;
+  404 and 405 need the router, 413 needs bodies)
 
-**M3: Routing and static files (0/7)**
+**M3: Routing and static files (1/7)**
 
 - [ ] Concept-constrained router
 - [ ] Static file serving
 - [ ] MIME type table
 - [ ] Path-traversal protection
-- [ ] Keep-alive state machine
+- [ ] Keep-alive state machine (keep-alive decision and reuse work; idle timeouts do not)
 - [ ] Idle timeouts without a thread per connection
-- [ ] Remove the placeholder echo protocol
 
 **M4: Quality (3/8 done, the three done items are listed above)**
 
@@ -296,6 +326,10 @@ size limits in the parser.
 - [ ] Bound reads per wakeup so one fast sender cannot starve others
 - [ ] Cap the per-connection write buffer
 - [ ] Remove the unused `HttpMethod::DELETE`
+- [ ] Combine repeated `Connection` headers in `Request::shouldKeepAlive` (RFC 9110 §5.3):
+  `Connection: TE` followed by `Connection: close` is read as keep-alive today, because
+  `getHeaderValue` returns only the first match. Enable
+  `KeepAliveTest.DISABLED_RepeatedConnectionHeadersAreCombined` when fixed.
 - [ ] Warning flags on the `server` and `common` targets (only tests have them today)
 
 ### Profiling plan
