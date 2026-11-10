@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <ostream>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -10,7 +11,7 @@
 // WEB-6 acceptance tests for the incremental request-head parser.
 //
 // All calls go through run() so a signature change only needs editing there.
-// run() flattens Result<variant<Done, NeedMore>, ParseError> into one variant.
+// http::parse() returns std::variant<Done, NeedMore, ParseError> directly.
 
 namespace
 {
@@ -24,16 +25,8 @@ namespace
 
     constexpr SizeLimits kLimits{.maxRequestLineSize = 256, .maxHeaderSize = 1024, .maxHeaderCount = 8};
 
-    Outcome run(std::string_view buffer, const SizeLimits &limits = kLimits)
-    {
-        auto result = http::parse(buffer, limits);
-        if (!result.ok())
-            return result.error();
-        auto &v = result.value();
-        if (auto *d = std::get_if<Done>(&v))
-            return *d;
-        return NeedMore{};
-    }
+    // http::parse() already returns the flat variant; the wrapper keeps call sites stable.
+    Outcome run(std::string_view buffer, const SizeLimits &limits = kLimits) { return http::parse(buffer, limits); }
 
     const Done *asDone(const Outcome &o) { return std::get_if<Done>(&o); }
     bool isNeedMore(const Outcome &o) { return std::holds_alternative<NeedMore>(o); }
@@ -249,6 +242,9 @@ struct BadCase
     std::string input;
     int expectedStatus;
 };
+
+// Printed by --gtest_list_tests; without it gtest dumps raw bytes and ctest gets unusable test names.
+void PrintTo(const BadCase &c, std::ostream *os) { *os << c.name; }
 
 class ParserMalformedTest : public ::testing::TestWithParam<BadCase>
 {

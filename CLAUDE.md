@@ -106,14 +106,15 @@ server/include/network/SocketIo.h        readAllAvailable / writeSome over Resul
 server/include/network/Connection.h      client fd + read/write buffers
 server/include/http/Request.h            Request (string_views into the read buffer), SizeLimits, iequals
 server/include/http/Parser.h             http::parse(): stateless request-head parser, ParseError
+server/include/http/Response.h           Response::serialize(), StatusCode, reason phrases
 server/include/server/Server.h           listener, accept loop, client table, clientCallback
 server/src/main.cpp                      wiring only
-tests/                                   GoogleTest (FetchContent): error, result, socketio, parser tests
-scripts/check_*.sh                       WEB-1..WEB-4 checks (see Workflow conventions)
+tests/                                   GoogleTest (FetchContent): error, result, socketio, parser, response, request (keep-alive) tests
+scripts/check_*.sh                       WEB-1..WEB-4 and WEB-7 checks (see Workflow conventions)
 docs/tickets/WEB-<n>.md                  tickets from /next_task
 ```
 
-## Current architecture (after WEB-6)
+## Current architecture (after WEB-7)
 
 - `EpollReactor` is a dumb dispatcher: `add(fd, events, handler)`, `modify`, `remove`,
   `run()` (one `epoll_wait` pass). All four return `Result<void>`. Handlers are
@@ -136,14 +137,29 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 - `ServerConfig` (`server/ServerConfig.h`) holds `ip`, `port`, `maxConnections` (default
   100) and `backlogSize` (default 10'000). `main` parses `--port`, `--max-connections`,
   `--backlog` into it. The kernel caps the backlog at `net.core.somaxconn`.
-- HTTP head parser (`http/Parser.h`, not wired into `Server` yet): `http::parse(std::string_view
-  buffer, const SizeLimits &) -> Result<std::variant<Done, NeedMore>, ParseError>`. Stateless: on
+- HTTP head parser (`http/Parser.h`, wired into `Server` since WEB-7): `http::parse(std::string_view
+  buffer, const SizeLimits &) -> ParseOutcome = std::variant<Done, NeedMore, ParseError>` (a plain
+  variant, not a `Result`: protocol errors are expected outcomes). Stateless: on
   `NeedMore` the caller appends more bytes and calls again (re-scan, O(N^2) byte-by-byte, fine at
   8 KiB). `Done` holds a `Request` (views into `buffer`, valid until the buffer is modified) and
-  `consumed_bytes`. Protocol errors are `ParseError` values (400/414/431/501/505), not `Error`.
+  `consumed_bytes`. Protocol errors are `ParseError` values (400/414/431/501/505; the enum also lists
+  404/405/413/500, which the parser never returns), not `Error`.
   Supports GET/HEAD/POST over HTTP/1.0 and 1.1; HTTP/1.1 requires `Host`. Rejects bare LF/CR, NUL,
   obs-fold, space before colon, bad header-name tokens, duplicate `Content-Length`.
-  `Request::getHeaderValue` is case-insensitive. Bodies are not parsed yet (`body` is empty).
+  `Request::getHeaderValue` is case-insensitive (first match only). Bodies are not parsed yet
+  (`body` is empty).
+- `Request::shouldKeepAlive()`: HTTP/1.1 persistent unless the `Connection` value list contains
+  `close`; HTTP/1.0 closes unless it contains `keep-alive`; `close` wins. The value is split on commas,
+  case-insensitive, OWS trimmed. Only the first `Connection` header line is read (README roadmap).
+- `http::Response` (`http/Response.h`): `Response(StatusCode, body, extraHeaders, close)`,
+  `serialize()` always emits `Content-Length`, plus `Connection: close` when asked. `StatusCode` and
+  `statusCodeToReasonPhrase()` live in the same header (`ParseError` values cast to `StatusCode`).
+- `Server::clientCallback` after `readAllAvailable`: loop `http::parse(buf)`. `Done` queues a fixed
+  `200 OK` (`text/plain`, `Hello, World!`; `HEAD` drops the body bytes), `buf.erase(0, consumed_bytes)`
+  per request, and `setReadClosed(true)` + stop if the connection must close. `ParseError` queues the
+  error status with `Connection: close`, `setReadClosed(true)`, stops (rest of the buffer is dropped).
+  One `flush()` per wakeup closes a read-closed connection once the output drains. Pipelining works
+  because the loop runs until `NeedMore`. There is no router yet (M3); every request gets the same body.
 - `Connection` owns its `FileDescriptor` and read buffer. Closing = `reactor.remove(fd)`
   then erase from the map (the destructor closes the fd; never call raw `close` on an
   fd a `Connection` owns).
@@ -153,15 +169,19 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
-  WEB-6 (done: standalone HTTP request-head parser + 48 tests). Next: a small cleanup ticket
-  (argument validation, `[[nodiscard]] Result`, warning flags) and/or M2 part 2: `Content-Length`
-  bodies and wiring the parser into `Server`.
+  WEB-7 (done: `http::Response`, parser wired into `Server`, keep-alive/pipelining/HEAD, NUL echo
+  removed, tests for response and keep-alive, old check scripts ported to HTTP). Next: WEB-8 `Content-Length`
+  bodies + 413, and/or a small cleanup ticket (argument validation, `[[nodiscard]] Result`, warning
+  flags).
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
-  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion). All pass on `web-6`.
+  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_http.sh` (WEB-7: GET/HEAD,
+  keep-alive, HTTP/1.0, pipelining, error statuses, curl). `check_write_path.sh` and `check_scale.sh`
+  speak HTTP now (backpressure = 100k pipelined requests). All pass on `web-7`.
   Scripts count connections with `ss`, not server logs. Pass `--max-connections` explicitly.
-- Unit tests: `ctest --test-dir build --output-on-failure` (74 tests on `web-6`). Add a
-  test with every new parser/router/buffer unit; `SocketIo` tests use `socketpair`; parser tests are socket-free.
+- Unit tests: `ctest --test-dir build --output-on-failure` (123 tests on `web-7`, 1 of
+  them `DISABLED_`: repeated `Connection` headers). Add a test with every new parser/router/buffer
+  unit; `SocketIo` tests use `socketpair`; parser, response and keep-alive tests are socket-free.
 
 ## Build
 
@@ -210,6 +230,11 @@ state change, listener back to level-triggered, GoogleTest scaffolding (26 tests
 Fixed (WEB-6): `http::parse` and `Request` (see Current architecture), `Server` constructor no
 longer reads the moved-from `config` (uses `m_config`), 48 parser tests.
 
+Fixed (WEB-7): `Response` serializer, parser wired into `Server` (keep-alive, pipelining, `HEAD`,
+error responses that close after the flush), NUL-framed echo and `processFrames` removed,
+`Request::shouldKeepAlive` with `Connection` token lists, `ResponseTest`/`ReasonPhraseTest`/
+`KeepAliveTest` (+49 tests), `scripts/check_http.sh`, other check scripts ported to HTTP.
+
 Open:
 
 - Argument parsing: `std::stoi` accepts trailing garbage and there are no range checks
@@ -223,7 +248,13 @@ Open:
   is undefined behavior; `Error(errno != 0 ? errno : EIO)` fallbacks after `modify()`.
 - `ReadOutcome::bytes_read` is unused by the caller. Untested `SocketIo` paths:
   `ECONNRESET` on read, the `EINTR` retry, `send` returning 0.
-- Wire protocol (NUL-padded frames) disappears once HTTP lands.
+- Repeated `Connection` header lines are not combined (`getHeaderValue` returns the first):
+  `Connection: TE` then `Connection: close` is read as keep-alive. Disabled test:
+  `KeepAliveTest.DISABLED_RepeatedConnectionHeadersAreCombined`. Roadmap in README.
+- HTTP/1.0 keep-alive responses carry no `Connection: keep-alive` header; a strict 1.0 client may
+  close anyway.
+- `ParseError` duplicates `StatusCode` (and lists codes the parser never returns); `Server` casts
+  between them.
 - `HttpMethod::DELETE` is in the enum but the parser never returns it (501); remove it.
 - Argument parsing review (verified): `--port 70000` binds 4464 while printing 70000,
   `--max-connections -1` starts and sheds every client.
@@ -233,9 +264,10 @@ Open:
   `modify()` instead. The write buffer has no cap (a non-reading client grows it).
 - `EpollReactor` constructor throws outside `main`'s `try`; warning flags exist only on the
   test target.
-- `processFrames` does `buf.erase(0, pos + 1)` per frame: quadratic on big bursts
-  (measured: 20k frames 0.37 s, 40k 0.53 s, 80k 3.39 s). Profiling candidate: parse with
-  an offset and compact once.
+- `Server::clientCallback` does `buf.erase(0, consumed_bytes)` per pipelined request: quadratic on big
+  bursts (the 100k-request backpressure case in `check_write_path.sh` costs ~4 s of CPU). Profiling
+  candidate: parse from an offset and compact once after the loop. (The old per-frame
+  `processFrames` erase is gone with the NUL protocol.)
 - `readAllAvailable` drains until `EAGAIN` with no cap, so one fast sender can starve the other
   clients and grow the read buffer without bound. Memory is fixed by the M2 size limits
   (413/431), not by a read cap.

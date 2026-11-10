@@ -6,21 +6,10 @@
 #include <cstdint>
 #include <string_view>
 #include <variant>
-#include "common/Result.h"
-
 #include "http/Request.h"
 
 namespace http
 {
-    enum class ParseError : uint16_t
-    {
-        BadRequest = 400,
-        UriTooLong = 414,
-        HeaderTooLarge = 431,
-        UnknownMethod = 501,
-        BadVersion = 505,
-    };
-
     struct Done
     {
         Request request;
@@ -30,8 +19,20 @@ namespace http
     struct NeedMore
     {
     };
+    enum class ParseError : uint16_t
+    {
+        BadRequest = 400,
+        NotFound = 404,
+        MethodNotAllowed = 405,
+        ContentTooLarge = 413,
+        UriTooLong = 414,
+        HeaderTooLarge = 431,
+        InternalServerError = 500,
+        NotImplemented = 501,
+        BadVersion = 505,
+    };
 
-    using ParseOutcome = Result<std::variant<Done, NeedMore>, ParseError>;
+    using ParseOutcome = std::variant<Done, NeedMore, ParseError>;
 
     [[nodiscard]] constexpr bool isValidToken(std::string_view token) noexcept
     {
@@ -126,7 +127,7 @@ namespace http
         else if (method_str == "HEAD")
             method = HttpMethod::HEAD;
         else
-            return ParseError::UnknownMethod;
+            return ParseError::NotImplemented;
 
         size_t target_start = method_end + 1;
         size_t target_end = request_line.find(' ', target_start);
