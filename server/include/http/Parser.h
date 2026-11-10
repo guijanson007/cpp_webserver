@@ -3,24 +3,14 @@
 
 #include <cctype>
 #include <cstddef>
-#include <cstdint>
 #include <string_view>
 #include <variant>
 #include "common/Result.h"
-
 #include "http/Request.h"
+#include "http/Response.h"
 
 namespace http
 {
-    enum class ParseError : uint16_t
-    {
-        BadRequest = 400,
-        UriTooLong = 414,
-        HeaderTooLarge = 431,
-        UnknownMethod = 501,
-        BadVersion = 505,
-    };
-
     struct Done
     {
         Request request;
@@ -31,7 +21,7 @@ namespace http
     {
     };
 
-    using ParseOutcome = Result<std::variant<Done, NeedMore>, ParseError>;
+    using ParseOutcome = Result<std::variant<Done, NeedMore>, StatusCode>;
 
     [[nodiscard]] constexpr bool isValidToken(std::string_view token) noexcept
     {
@@ -87,35 +77,35 @@ namespace http
         {
             char c = buffer[line_end];
             if (c == '\0')
-                return ParseError::BadRequest;
+                return StatusCode::BadRequest;
             if (c == '\r')
             {
                 if (line_end + 1 >= buffer.size())
                     return {NeedMore{}};
                 if (buffer[line_end + 1] != '\n')
-                    return ParseError::BadRequest;
+                    return StatusCode::BadRequest;
                 break;
             }
             if (c == '\n')
-                return ParseError::BadRequest;
+                return StatusCode::BadRequest;
             ++line_end;
         }
 
         if (line_end >= buffer.size())
         {
             if (buffer.size() > limits.maxRequestLineSize)
-                return ParseError::UriTooLong;
+                return StatusCode::UriTooLong;
             return {NeedMore{}};
         }
 
         if (line_end > limits.maxRequestLineSize)
-            return ParseError::UriTooLong;
+            return StatusCode::UriTooLong;
 
         std::string_view request_line = buffer.substr(0, line_end);
 
         size_t method_end = request_line.find(' ');
         if (method_end == std::string_view::npos)
-            return ParseError::BadRequest;
+            return StatusCode::BadRequest;
 
         std::string_view method_str = request_line.substr(0, method_end);
         HttpMethod method;
@@ -126,16 +116,16 @@ namespace http
         else if (method_str == "HEAD")
             method = HttpMethod::HEAD;
         else
-            return ParseError::UnknownMethod;
+            return StatusCode::NotImplemented;
 
         size_t target_start = method_end + 1;
         size_t target_end = request_line.find(' ', target_start);
         if (target_end == std::string_view::npos)
-            return ParseError::BadRequest;
+            return StatusCode::BadRequest;
 
         std::string_view target = request_line.substr(target_start, target_end - target_start);
         if (target.empty())
-            return ParseError::BadRequest;
+            return StatusCode::BadRequest;
 
         std::string_view version = request_line.substr(target_end + 1);
         if (version != "HTTP/1.1" && version != "HTTP/1.0")
@@ -144,9 +134,9 @@ namespace http
                 std::isdigit(static_cast<unsigned char>(version[5])) && version[6] == '.' &&
                 std::isdigit(static_cast<unsigned char>(version[7])))
             {
-                return ParseError::BadVersion;
+                return StatusCode::BadVersion;
             }
-            return ParseError::BadRequest;
+            return StatusCode::BadRequest;
         }
 
         size_t cursor = line_end + 2;
@@ -160,7 +150,7 @@ namespace http
             {
                 cursor += 2;
                 if (!seen_host && version == "HTTP/1.1")
-                    return ParseError::BadRequest;
+                    return StatusCode::BadRequest;
 
                 std::string_view raw_headers = buffer.substr(line_end + 2, (cursor - 2) - (line_end + 2));
                 return {Done{Request{.header = raw_headers,
@@ -177,57 +167,57 @@ namespace http
             }
 
             if (buffer[cursor] == ' ' || buffer[cursor] == '\t')
-                return ParseError::BadRequest;
+                return StatusCode::BadRequest;
 
             size_t h_line_end = cursor;
             while (h_line_end < buffer.size())
             {
                 char c = buffer[h_line_end];
                 if (c == '\0')
-                    return ParseError::BadRequest;
+                    return StatusCode::BadRequest;
                 if (c == '\r')
                 {
                     if (h_line_end + 1 >= buffer.size())
                         return {NeedMore{}};
                     if (buffer[h_line_end + 1] != '\n')
-                        return ParseError::BadRequest;
+                        return StatusCode::BadRequest;
                     break;
                 }
                 if (c == '\n')
-                    return ParseError::BadRequest;
+                    return StatusCode::BadRequest;
                 ++h_line_end;
             }
 
             if (h_line_end >= buffer.size())
             {
                 if (buffer.size() > limits.maxHeaderSize)
-                    return ParseError::HeaderTooLarge;
+                    return StatusCode::HeaderTooLarge;
                 return {NeedMore{}};
             }
 
             if (h_line_end + 4 > limits.maxHeaderSize)
-                return ParseError::HeaderTooLarge;
+                return StatusCode::HeaderTooLarge;
 
             if (++header_count > limits.maxHeaderCount)
-                return ParseError::HeaderTooLarge;
+                return StatusCode::HeaderTooLarge;
 
             std::string_view h_line = buffer.substr(cursor, h_line_end - cursor);
             cursor = h_line_end + 2;
 
             size_t colon = h_line.find(':');
             if (colon == 0 || colon == std::string_view::npos)
-                return ParseError::BadRequest;
+                return StatusCode::BadRequest;
             if (h_line[colon - 1] == ' ' || h_line[colon - 1] == '\t')
-                return ParseError::BadRequest;
+                return StatusCode::BadRequest;
 
             std::string_view name = h_line.substr(0, colon);
             if (!isValidToken(name))
-                return ParseError::BadRequest;
+                return StatusCode::BadRequest;
 
             if (iequals(name, "Content-Length"))
             {
                 if (seen_content_length)
-                    return ParseError::BadRequest;
+                    return StatusCode::BadRequest;
                 seen_content_length = true;
             }
             else if (iequals(name, "Host"))
@@ -237,7 +227,7 @@ namespace http
         }
 
         if (buffer.size() > limits.maxHeaderSize)
-            return ParseError::HeaderTooLarge;
+            return StatusCode::HeaderTooLarge;
         return {NeedMore{}};
     }
 } // namespace http

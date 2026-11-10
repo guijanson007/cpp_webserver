@@ -23,6 +23,7 @@ namespace http
         size_t maxHeaderCount = 100;
     };
 
+
     [[nodiscard]] constexpr bool iequals(std::string_view lhs, std::string_view rhs) noexcept
     {
         if (lhs.size() != rhs.size())
