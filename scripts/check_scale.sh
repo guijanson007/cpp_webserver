@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WEB-4 check: configurable connection cap, 10k idle connections, fd exhaustion.
+# WEB-4 check (ported to HTTP in WEB-7): configurable connection cap, 10k idle connections, fd exhaustion.
 #
 # Usage: scripts/check_scale.sh [server-binary] [port]
 # Defaults: build/server/server, 8080
@@ -10,7 +10,7 @@
 # Phases:
 #   1. cap:     --max-connections 100, 150 clients -> exactly 100 kept, server alive
 #   2. scale:   ulimit -n 20000, --max-connections 12000, 10000 idle clients,
-#               a fresh client still gets its echo, idle CPU stays low
+#               a fresh client still gets a 200, idle CPU stays low
 #   3. EMFILE:  server started with ulimit -n 256, 400 clients -> no crash,
 #               no busy loop (CPU sampled over 2 s), existing clients still served
 set -u
@@ -93,22 +93,22 @@ close_clients() {
   HOLDER_PID=""
 }
 
-# echo_ok: a fresh client sends one frame and must get it back.
-echo_ok() {
+# http_ok: a fresh client sends one GET and must get a 200 back.
+http_ok() {
   python3 -I - "$PORT" <<'PY'
 import socket, sys
 data = b""
 try:
     s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3)
-    s.sendall(b"ping\0")
-    while not data.endswith(b"\0"):
-        chunk = s.recv(64)
+    s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    while b"\r\n\r\n" not in data:
+        chunk = s.recv(256)
         if not chunk:
             break
         data += chunk
 except OSError:
-    pass  # shed or reset: counts as "no echo", not as a script error
-sys.exit(0 if data == b"ping\0" else 1)
+    pass  # shed or reset: counts as "no response", not as a script error
+sys.exit(0 if data.startswith(b"HTTP/1.1 200 OK\r\n") else 1)
 PY
 }
 
@@ -131,10 +131,10 @@ server_alive || fail "server crashed with 150 clients and a cap of 100"
 n=$(server_conns)
 ((n == 100)) || fail "expected 100 established connections, got $n"
 pass "exactly 100 connections kept, the rest shed, server alive"
-echo_ok && fail "a client got through above the cap" || true
+http_ok && fail "a client got through above the cap" || true
 close_clients
 sleep 1
-echo_ok || fail "no echo after the clients left"
+http_ok || fail "no HTTP response after the clients left"
 pass "slots freed after clients left"
 stop_all
 
@@ -153,7 +153,7 @@ else
   n=$(server_conns)
   ((n == 10000)) || fail "expected 10000 established connections, got $n"
   pass "10000 connections held, server alive"
-  echo_ok || fail "no echo for a fresh client while 10000 connections are open"
+  http_ok || fail "no HTTP response for a fresh client while 10000 connections are open"
   pass "fresh client still served"
   cpu=$(cpu_percent 2)
   ((cpu < 10)) || fail "idle server uses ${cpu}% CPU with 10000 idle connections"
@@ -174,7 +174,7 @@ cpu=$(cpu_percent 2)
 pass "no busy loop (CPU ${cpu}%)"
 close_clients
 sleep 1
-echo_ok || fail "server does not accept new clients after fds were freed"
+http_ok || fail "server does not accept new clients after fds were freed"
 pass "server recovers once fds are freed"
 stop_all
 
