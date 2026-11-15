@@ -183,6 +183,17 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
   them `DISABLED_`: repeated `Connection` headers). Add a test with every new parser/router/buffer
   unit; `SocketIo` tests use `socketpair`; parser, response and keep-alive tests are socket-free.
 
+## Webserver ticket workflow (WEB-N)
+
+A ticket is only closeable when all of the following are done:
+
+1. docs/tickets/WEB-N.md exists (scope, findings, bugs, verification).
+2. Tests have been added or updated and all pass.
+3. scripts/check_*.sh passes.
+4. README and roadmap are updated.
+5. The branch is pushed and a PR is opened against main.
+Do not declare a ticket done until you have run the actual end-to-end check against a fresh build.
+
 ## Build
 
 ```
