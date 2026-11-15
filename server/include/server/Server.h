@@ -296,6 +296,14 @@ private:
             auto &buf = client.getReadBuffer();
             auto result = SocketIo::readAllAvailable(client_fd, buf);
 
+            if (!result)
+            {
+                // Real kernel I/O error
+                closeClientConnection(client_fd);
+                return;
+            }
+
+            const auto &outcome = result.value();
             while (true)
             {
                 http::ParseOutcome parseOutcome = http::parse(buf);
@@ -334,14 +342,6 @@ private:
                 }
             }
 
-            if (!result)
-            {
-                // Real kernel I/O error
-                closeClientConnection(client_fd);
-                return;
-            }
-
-            const auto &outcome = result.value();
             if (outcome.state == ConnectionState::ClosedByPeer)
             {
                 client.setReadClosed(true);
