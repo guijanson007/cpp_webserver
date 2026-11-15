@@ -1,9 +1,11 @@
 // Parser.h
 #pragma once
 
+#include <charconv>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <system_error>
 #include <string_view>
 #include <variant>
 #include "http/Request.h"
@@ -79,7 +81,7 @@ namespace http
      * Performance Note:
      * Parsing is stateless. On `NeedMore`, the next call will rescan the buffer from
      * the beginning. This incurs an O(N^2) cost byte-by-byte for incomplete reads,
-     * which is acceptable for typical head size limits (e.g., 8 KiB).
+     * but only rescans the request head while a body is incomplete.
      */
     [[nodiscard]] inline ParseOutcome parse(std::string_view buffer, const SizeLimits &limits = {})
     {
@@ -153,6 +155,8 @@ namespace http
         size_t cursor = line_end + 2;
         size_t header_count = 0;
         bool seen_content_length = false;
+        size_t content_length = 0;
+        bool seen_transfer_encoding = false;
         bool seen_host = false;
 
         while (cursor < buffer.size())
@@ -164,12 +168,19 @@ namespace http
                     return ParseError::BadRequest;
 
                 std::string_view raw_headers = buffer.substr(line_end + 2, (cursor - 2) - (line_end + 2));
+                if (seen_transfer_encoding)
+                    return ParseError::NotImplemented;
+                if (content_length > limits.maxBodySize)
+                    return ParseError::ContentTooLarge;
+                const size_t body_start = cursor;
+                if (buffer.size() - body_start < content_length)
+                    return {NeedMore{}};
                 return {Done{Request{.header = raw_headers,
-                                     .body = {},
+                                     .body = buffer.substr(body_start, content_length),
                                      .target = target,
                                      .version = version,
                                      .method = method},
-                             cursor}};
+                             body_start + content_length}};
             }
 
             if (cursor < buffer.size() && buffer[cursor] == '\r' && cursor + 1 == buffer.size())
@@ -230,7 +241,25 @@ namespace http
                 if (seen_content_length)
                     return ParseError::BadRequest;
                 seen_content_length = true;
+                std::string_view value = h_line.substr(colon + 1);
+                while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+                    value.remove_prefix(1);
+                while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+                    value.remove_suffix(1);
+                if (value.empty())
+                    return ParseError::BadRequest;
+                for (unsigned char c: value)
+                {
+                    if (!std::isdigit(c))
+                        return ParseError::BadRequest;
+                }
+                const auto parsed =
+                        std::from_chars(value.data(), value.data() + value.size(), content_length);
+                if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size())
+                    return ParseError::BadRequest;
             }
+            else if (iequals(name, "Transfer-Encoding"))
+                seen_transfer_encoding = true;
             else if (iequals(name, "Host"))
             {
                 seen_host = true;
