@@ -6,10 +6,10 @@ tested and benchmarked server where every design decision is backed by profiling
 
 > **Status: work in progress.** The networking core (reactor, non-blocking I/O, write
 > path, connection limits, error handling) is done, and the server now speaks HTTP/1.1
-> request heads: it parses them, answers with a fixed `200 OK` (or a 4xx/5xx error),
-> and supports keep-alive, pipelining and `HEAD`. There is no router, no request body
-> handling and no static files yet, so every successful request gets the same
-> `Hello, World!` body. See [Progress](#progress).
+> requests: it parses heads and `Content-Length` bodies (413 over 1 MiB), answers with a
+> fixed `200 OK` (or a 4xx/5xx error), and supports keep-alive, pipelining and `HEAD`.
+> There is no router and no static files yet, so every successful request gets the same
+> `Hello, World!` body and the request body is ignored. See [Progress](#progress).
 
 ## Platform and design decisions
 
@@ -67,8 +67,8 @@ tested and benchmarked server where every design decision is backed by profiling
 | `EpollReactor` | `server/include/network/` | Dumb dispatcher. `run()` does one `epoll_wait` pass and calls the registered handler. A handler may remove itself safely. |
 | `SocketIo` | `server/include/network/` | Non-blocking read and write wrappers. EOF and `EAGAIN` are success values, not errors. |
 | `Connection` | `server/include/network/` | Client fd plus read and write buffers. Closing a connection closes its fd through the destructor. |
-| `http::parse` | `server/include/http/Parser.h` | Stateless, incremental request-head parser. Returns a `std::variant<Done, NeedMore, ParseError>`. `Done` holds a `Request` plus `consumed_bytes`. |
-| `Request` | `server/include/http/Request.h` | `string_view`s into the read buffer (method, target, version, raw headers) with a case-insensitive `getHeaderValue()` and `shouldKeepAlive()`. Also `SizeLimits`. |
+| `http::parse` | `server/include/http/Parser.h` | Stateless, incremental request parser (head and `Content-Length` body). Returns a `std::variant<Done, NeedMore, ParseError>`. `Done` holds a `Request` plus `consumed_bytes`. |
+| `Request` | `server/include/http/Request.h` | `string_view`s into the read buffer (method, target, version, raw headers, body) with a case-insensitive `getHeaderValue()` and `shouldKeepAlive()`. Also `SizeLimits`. |
 | `Response` | `server/include/http/Response.h` | Status, body and extra headers. `serialize()` always emits `Content-Length`, plus `Connection: close` when asked. `StatusCode` and `statusCodeToReasonPhrase()` live here. |
 | `Server` | `server/include/server/` | Listener, accept loop, connection table, cap enforcement, `EMFILE` handling, and the per-connection parse and respond loop. |
 | `ServerConfig` | `server/include/server/` | `ip`, `port`, `maxConnections`, `backlogSize`. |
@@ -112,24 +112,29 @@ tested and benchmarked server where every design decision is backed by profiling
 - **Zero-copy.** The `Request` holds views into the caller's buffer. They stay valid only
   until that buffer is modified. `consumed_bytes` tells the caller how much to drop, and
   pipelined bytes after the head are left alone.
-- **Limits.** Request line, header block and header count are capped by `SizeLimits`
-  (defaults 8192 / 8192 / 100), checked before the terminator arrives so a slow peer
-  cannot make the server buffer forever. Over-limit gives 414 or 431.
+- **Limits.** Request line, header block, header count and body are capped by `SizeLimits`
+  (defaults 8192 / 8192 / 100 / 1 MiB). Head limits are checked before the terminator
+  arrives so a slow peer cannot make the server buffer forever. Over-limit gives 414, 431
+  or 413.
 - **Strictness (400).** Bare LF or CR, NUL bytes, obs-fold, whitespace before the colon,
   invalid header-name tokens, duplicate `Content-Length` (request smuggling) and, for
   HTTP/1.1, a missing `Host`. Unsupported methods give 501; a well-formed unsupported
   `HTTP/x.y` gives 505.
-- **Not parsed yet.** Request bodies (`Content-Length`), so `Request::body` is empty. A POST
-  with a body is not supported until the next ticket.
+- **Bodies (WEB-8).** `Content-Length` must be digits only (no sign, no spaces, no overflow,
+  no duplicates, else 400). `Request::body` is a view of exactly that many bytes and
+  `consumed_bytes` covers head plus body. An incomplete body gives `NeedMore`. A declared
+  length over `maxBodySize` gives 413 as soon as the head is parsed, before any body byte
+  arrives, and the connection closes. Any `Transfer-Encoding` gives 501 (chunked is
+  roadmap-only), which also closes the request-smuggling gap of ignoring it.
 
 ## Planned HTTP scope (v1)
 
 - Methods: `GET`, `HEAD`, `POST`.
 - Hand-written, incremental parser over `std::string_view`, zero-copy. No llhttp or
   http-parser. **Done for the request line and headers, and wired into the server.**
-- Request-line and header size limits (431 and 414 done; 413 comes with bodies).
-- Status codes: 400, 404, 405, 413, 431, 500.
-- `Content-Length` request bodies.
+- Request-line, header and body size limits (414, 431 and 413 done).
+- Status codes: 400, 404, 405, 413, 431, 500 (404 and 405 need the router).
+- `Content-Length` request bodies. **Done.**
 - Keep-alive with idle timeouts.
 - Static files with MIME types and path-traversal protection.
 - Concept-constrained router.
@@ -183,7 +188,7 @@ Every request currently gets the same fixed response. Routing and static files c
 
 ## Test
 
-Unit tests use GoogleTest and live in a single target, `common_tests` (123 tests, 1 disabled
+Unit tests use GoogleTest and live in a single target, `common_tests` (133 tests, 1 disabled
 known-gap test):
 
 ```sh
@@ -208,7 +213,7 @@ These start the server themselves. Each takes `[server-binary] [port]` and defau
 | `scripts/check_reactor.sh` | Reactor behaviour (uses `strace` and `ss`). |
 | `scripts/check_write_path.sh` | Pipelined responses, RST survival, backpressure (100k pipelined requests, ~8 MB out), half-close flush, `EPOLLOUT` armed only when needed. |
 | `scripts/check_scale.sh` | The cap, 10k idle connections, fd exhaustion. |
-| `scripts/check_http.sh` | GET, HEAD, keep-alive, HTTP/1.0, `Connection: close`, pipelining, byte-by-byte requests, 400/414/431/501/505 followed by close, `curl`. |
+| `scripts/check_http.sh` | GET, HEAD, keep-alive, HTTP/1.0, `Connection: close`, pipelining, byte-by-byte requests, 400/414/431/501/505 followed by close, POST bodies (framing, pipelining, split, 1 MiB limit, 413 before the body, bad lengths, `Transfer-Encoding`), `curl` GET and POST. |
 
 The scripts count connections with `ss`, not server logs.
 
@@ -227,10 +232,10 @@ Planned: the router in `server/include/http/` and `docs/PERFORMANCE.md`.
 
 ## Progress
 
-### Estimated completion: 44%
+### Estimated completion: 50%
 
 ```
-[#########...........]  44%   (15 of 34 required items)
+[##########..........]  50%   (17 of 34 required items)
 ```
 
 How it is computed: the checklist below has 34 required items across milestones M1-M5.
@@ -261,6 +266,11 @@ average done item, so real progress is probably a bit lower.
 - [x] `GET`, `HEAD`, `POST` handling: the parser is wired into `Server`, with keep-alive,
   pipelining and error responses (fixed `200` body; bodies and routing come later)
 
+**M2 (partial): request bodies (WEB-8)**
+
+- [x] `Content-Length` bodies (strict parsing, resumable across partial reads, pipelining-safe)
+- [x] Size limits: 414, 431 and 413 (body over `maxBodySize` refused from the head alone)
+
 **M3 (partial)**
 
 - [x] Placeholder echo protocol removed
@@ -269,7 +279,7 @@ average done item, so real progress is probably a bit lower.
 
 - [x] GoogleTest wired in through `FetchContent`
 - [x] Unit tests for `Error`, `Result` and `SocketIo` (26 tests)
-- [x] Parser unit tests (48 tests: split at every offset, size limits, malformed input)
+- [x] Parser unit tests (split at every offset, size limits, malformed input, bodies)
 - [x] Response and keep-alive unit tests (`ResponseTest`, `ReasonPhraseTest`, `KeepAliveTest`)
 
 Also done and not counted separately: `Result<T, Error>` error handling with concept
@@ -279,12 +289,10 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, five end-to-end ch
 
 ### Planned
 
-**M2: HTTP core (4/7 done, listed above)**
+**M2: HTTP core (6/7 done, listed above)**
 
-- [ ] Size limits (431 and 414 done in the parser; 413 needs bodies)
-- [ ] `Content-Length` bodies (next: WEB-8)
-- [ ] Status codes 400, 404, 405, 413, 431, 500 (400, 431, 414, 501, 505 are returned today;
-  404 and 405 need the router, 413 needs bodies)
+- [ ] Status codes 400, 404, 405, 413, 431, 500 (400, 413, 414, 431, 501, 505 are returned
+  today; 404 and 405 need the router, 500 needs a handler that can fail)
 
 **M3: Routing and static files (1/7)**
 

@@ -73,6 +73,105 @@ TEST(ParserTest, ParsesPostAndHead)
     EXPECT_EQ(asDone(h)->request.method, http::HttpMethod::HEAD);
 }
 
+TEST(ParserBodyTest, CompleteBody)
+{
+    const std::string input = "POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+    const Done *d = asDone(run(input));
+    ASSERT_NE(d, nullptr);
+    EXPECT_EQ(d->request.body, "hello");
+    EXPECT_EQ(d->consumed_bytes, input.size());
+}
+
+TEST(ParserBodyTest, PartialBodyNeedsMore)
+{
+    EXPECT_TRUE(isNeedMore(run("POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhell")));
+}
+
+TEST(ParserBodyTest, BodyByteByByteFeed)
+{
+    const std::string head = "POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n";
+    std::string input = head;
+    for (const char c: std::string_view("hello"))
+    {
+        input.push_back(c);
+        const Outcome outcome = run(input);
+        if (input.size() < head.size() + 5)
+            EXPECT_TRUE(isNeedMore(outcome));
+        else
+            ASSERT_EQ(asDone(outcome)->request.body, "hello");
+    }
+}
+
+TEST(ParserBodyTest, BodyExactlyAtLimit)
+{
+    const SizeLimits limits{.maxRequestLineSize = 256,
+                            .maxHeaderSize = 1024,
+                            .maxHeaderCount = 8,
+                            .maxBodySize = 5};
+    const std::string input = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+    const Done *d = asDone(run(input, limits));
+    ASSERT_NE(d, nullptr);
+    EXPECT_EQ(d->request.body, "hello");
+}
+
+TEST(ParserBodyTest, BodyOverLimitIs413BeforeBodyArrives)
+{
+    const SizeLimits limits{.maxRequestLineSize = 256,
+                            .maxHeaderSize = 1024,
+                            .maxHeaderCount = 8,
+                            .maxBodySize = 5};
+    const std::string input = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\n\r\n";
+    EXPECT_TRUE(isError(run(input, limits), 413));
+}
+
+TEST(ParserBodyTest, InvalidContentLengthIs400)
+{
+    for (const std::string value: {"-1", "+5", "5 5", "abc", "", "99999999999999999999"})
+    {
+        const std::string input = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: " + value + "\r\n\r\n";
+        EXPECT_TRUE(isError(run(input), 400)) << "value: " << value;
+    }
+}
+
+TEST(ParserBodyTest, TransferEncodingIs501)
+{
+    const std::string input = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    EXPECT_TRUE(isError(run(input), 501));
+}
+
+TEST(ParserBodyTest, PipelinedPostThenGet)
+{
+    const std::string input = "POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+                              "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    const Done *first = asDone(run(input));
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->request.body, "hello");
+
+    const Done *second = asDone(run(std::string_view(input).substr(first->consumed_bytes)));
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(second->request.target, "/next");
+}
+
+TEST(ParserBodyTest, ZeroLength)
+{
+    const std::string input = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+    const Done *d = asDone(run(input));
+    ASSERT_NE(d, nullptr);
+    EXPECT_TRUE(d->request.body.empty());
+}
+
+TEST(ParserBodyTest, GetAndHeadConsumeNonzeroBodies)
+{
+    for (const std::string method: {"GET", "HEAD"})
+    {
+        const std::string input = method + " / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
+        const Done *d = asDone(run(input));
+        ASSERT_NE(d, nullptr);
+        EXPECT_EQ(d->request.body, "abc");
+        EXPECT_EQ(d->consumed_bytes, input.size());
+    }
+}
+
 TEST(ParserTest, AcceptsHttp10)
 {
     const Outcome o = run("GET / HTTP/1.0\r\nHost: x\r\n\r\n");
@@ -305,7 +404,8 @@ TEST(ParserTest, EmptyBufferNeedsMore)
 TEST(ParserTest, HeaderNamesAreCaseInsensitiveForDuplicateDetection)
 {
     // Different headers are fine; only duplicate Content-Length is fatal.
-    const Outcome o = run("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nX-Other: 1\r\nX-Other: 2\r\n\r\n");
+    const Outcome o =
+            run("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nX-Other: 1\r\nX-Other: 2\r\n\r\nabc");
     EXPECT_NE(asDone(o), nullptr);
 }
 
@@ -329,7 +429,9 @@ TEST(ParserTest, HostHeaderNameIsCaseInsensitive)
 
 TEST(RequestTest, HeaderLookupIsCaseInsensitiveAndTrimsValue)
 {
-    const Outcome o = run("POST / HTTP/1.1\r\nHost: example.com\r\ncontent-LENGTH:   42 \t\r\n\r\n");
+    const Outcome o =
+            run("POST / HTTP/1.1\r\nHost: example.com\r\ncontent-LENGTH:   42 \t\r\n\r\n"
+                "123456789012345678901234567890123456789012");
     const Done *d = asDone(o);
     ASSERT_NE(d, nullptr);
     EXPECT_EQ(d->request.getHeaderValue("Content-Length"), std::optional<std::string_view>("42"));

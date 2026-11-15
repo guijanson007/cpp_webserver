@@ -21,6 +21,7 @@ namespace http
         size_t maxRequestLineSize = 8192;
         size_t maxHeaderSize = 8192;
         size_t maxHeaderCount = 100;
+        size_t maxBodySize = 1U << 20;
     };
 
 

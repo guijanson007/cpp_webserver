@@ -114,7 +114,7 @@ scripts/check_*.sh                       WEB-1..WEB-4 and WEB-7 checks (see Work
 docs/tickets/WEB-<n>.md                  tickets from /next_task
 ```
 
-## Current architecture (after WEB-7)
+## Current architecture (after WEB-8)
 
 - `EpollReactor` is a dumb dispatcher: `add(fd, events, handler)`, `modify`, `remove`,
   `run()` (one `epoll_wait` pass). All four return `Result<void>`. Handlers are
@@ -137,17 +137,22 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 - `ServerConfig` (`server/ServerConfig.h`) holds `ip`, `port`, `maxConnections` (default
   100) and `backlogSize` (default 10'000). `main` parses `--port`, `--max-connections`,
   `--backlog` into it. The kernel caps the backlog at `net.core.somaxconn`.
-- HTTP head parser (`http/Parser.h`, wired into `Server` since WEB-7): `http::parse(std::string_view
+- HTTP parser (`http/Parser.h`, wired into `Server` since WEB-7, bodies since WEB-8): `http::parse(std::string_view
   buffer, const SizeLimits &) -> ParseOutcome = std::variant<Done, NeedMore, ParseError>` (a plain
   variant, not a `Result`: protocol errors are expected outcomes). Stateless: on
   `NeedMore` the caller appends more bytes and calls again (re-scan, O(N^2) byte-by-byte, fine at
-  8 KiB). `Done` holds a `Request` (views into `buffer`, valid until the buffer is modified) and
-  `consumed_bytes`. Protocol errors are `ParseError` values (400/414/431/501/505; the enum also lists
-  404/405/413/500, which the parser never returns), not `Error`.
+  8 KiB; while a body is incomplete only the head is re-scanned). `Done` holds a `Request` (views into
+  `buffer`, valid until the buffer is modified) and `consumed_bytes` (head plus body). Protocol errors
+  are `ParseError` values (400/413/414/431/501/505; the enum also lists 404/405/500, which the parser
+  never returns), not `Error`.
   Supports GET/HEAD/POST over HTTP/1.0 and 1.1; HTTP/1.1 requires `Host`. Rejects bare LF/CR, NUL,
   obs-fold, space before colon, bad header-name tokens, duplicate `Content-Length`.
-  `Request::getHeaderValue` is case-insensitive (first match only). Bodies are not parsed yet
-  (`body` is empty).
+  `Request::getHeaderValue` is case-insensitive (first match only).
+  Bodies (WEB-8): `Content-Length` is digits only (`std::from_chars`; sign, spaces, empty, overflow
+  are 400). `Request::body` is a view of exactly that many bytes. Incomplete body is `NeedMore`.
+  Declared length over `SizeLimits::maxBodySize` (1 MiB) is 413 straight after the head, before any
+  body byte arrives. Any `Transfer-Encoding` is 501 (chunked is roadmap). The server still ignores
+  the body content (no router).
 - `Request::shouldKeepAlive()`: HTTP/1.1 persistent unless the `Connection` value list contains
   `close`; HTTP/1.0 closes unless it contains `keep-alive`; `close` wins. The value is split on commas,
   case-insensitive, OWS trimmed. Only the first `Connection` header line is read (README roadmap).
@@ -169,19 +174,29 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
-  WEB-7 (done: `http::Response`, parser wired into `Server`, keep-alive/pipelining/HEAD, NUL echo
-  removed, tests for response and keep-alive, old check scripts ported to HTTP). Next: WEB-8 `Content-Length`
-  bodies + 413, and/or a small cleanup ticket (argument validation, `[[nodiscard]] Result`, warning
-  flags).
+  WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
+  parsing, body section in `check_http.sh`). Next: M3 (router + static files) after, or together with,
+  a small cleanup ticket (argument validation, `[[nodiscard]] Result`, warning flags).
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
-  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_http.sh` (WEB-7: GET/HEAD,
-  keep-alive, HTTP/1.0, pipelining, error statuses, curl). `check_write_path.sh` and `check_scale.sh`
-  speak HTTP now (backpressure = 100k pipelined requests). All pass on `web-7`.
+  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_http.sh` (WEB-7/WEB-8: GET/HEAD,
+  keep-alive, HTTP/1.0, pipelining, error statuses, POST bodies, 413, curl). `check_write_path.sh` and `check_scale.sh`
+  speak HTTP now (backpressure = 100k pipelined requests). All pass on `web-8`.
   Scripts count connections with `ss`, not server logs. Pass `--max-connections` explicitly.
-- Unit tests: `ctest --test-dir build --output-on-failure` (123 tests on `web-7`, 1 of
+- Unit tests: `ctest --test-dir build --output-on-failure` (133 tests run on `web-8`, 1 of
   them `DISABLED_`: repeated `Connection` headers). Add a test with every new parser/router/buffer
   unit; `SocketIo` tests use `socketpair`; parser, response and keep-alive tests are socket-free.
+
+## Webserver ticket workflow (WEB-N)
+
+A ticket is only closeable when all of the following are done:
+
+1. docs/tickets/WEB-N.md exists (scope, findings, bugs, verification).
+2. Tests have been added or updated and all pass.
+3. scripts/check_*.sh passes.
+4. README and roadmap are updated.
+5. The branch is pushed and a PR is opened against main.
+Do not declare a ticket done until you have run the actual end-to-end check against a fresh build.
 
 ## Build
 
@@ -234,6 +249,11 @@ Fixed (WEB-7): `Response` serializer, parser wired into `Server` (keep-alive, pi
 error responses that close after the flush), NUL-framed echo and `processFrames` removed,
 `Request::shouldKeepAlive` with `Connection` token lists, `ResponseTest`/`ReasonPhraseTest`/
 `KeepAliveTest` (+49 tests), `scripts/check_http.sh`, other check scripts ported to HTTP.
+
+Fixed (WEB-8): `Content-Length` bodies framed (a POST body used to be parsed as the next request),
+`SizeLimits::maxBodySize` and 413 before the body arrives, `Transfer-Encoding` rejected with 501,
+`clientCallback` checks the `readAllAvailable` result before parsing, +11 tests, 9 body checks and
+curl POST checks in `check_http.sh`.
 
 Open:
 
