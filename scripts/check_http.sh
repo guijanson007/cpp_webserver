@@ -11,6 +11,16 @@
 #   7. split        a request sent byte by byte -> exactly one response
 #   8. errors       400/431/501/505 statuses, then the server closes the connection
 #   9. survival     the server still answers after all of the above
+# WEB-8 (Content-Length bodies):
+#  10. body              POST with a body -> 200, connection stays open and usable
+#  11. body-zero         POST/GET with Content-Length: 0 and GET with a body keep framing intact
+#  12. body-pipelined    POST + GET in one send -> two 200s, no stray 400
+#  13. body-split        head, then the body byte by byte -> exactly one response
+#  14. body-limit        a body of exactly 1 MiB is accepted
+#  15. body-too-large    over the limit -> 413 + close, answered before any body byte is sent
+#  16. body-bad-length   -1, +5, "5 5", abc, empty, overflow -> 400 + close
+#  17. body-te           Transfer-Encoding -> 501 + close
+#  18. body-survival     the server still answers after all of the above
 #
 # Usage: scripts/check_http.sh [server-binary] [port]
 # Defaults: build/server/server, 8080
@@ -196,6 +206,140 @@ elif case == "survival":
     st, *_ = read_response(s)
     check(st == 200, "server no longer answers: %d" % st)
 
+# ---- WEB-8: Content-Length bodies ----
+elif case == "body":
+    s = conn(); s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+    st, h, body, rest, line = read_response(s)
+    check(st == 200 and rest == b"", "POST with body: %r" % line)
+    check(h.get("connection", "").lower() != "close", "POST response closes an HTTP/1.1 keep-alive connection")
+    s.sendall(HOST_REQ)
+    st2, *_ = read_response(s)
+    check(st2 == 200, "request after a POST got %d (body leaked into the next request?)" % st2)
+    check(still_open(s), "connection closed after a POST")
+
+elif case == "body-zero":
+    s = conn()
+    s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+    st, *_ = read_response(s)
+    check(st == 200, "POST with Content-Length: 0 got %d" % st)
+    s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+    st, *_ = read_response(s)
+    check(st == 200, "GET with Content-Length: 0 got %d" % st)
+    # GET with a body: accepted, the body is consumed so the next request is framed correctly.
+    s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nabcd" + HOST_REQ)
+    buf = b""
+    for i in range(2):
+        st, _, _, buf, _ = read_response(s, buf)
+        check(st == 200, "GET-with-body sequence, response %d got %d" % (i, st))
+
+elif case == "body-pipelined":
+    post = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+    s = conn(); s.sendall(post + HOST_REQ)
+    buf = b""
+    for i in range(2):
+        st, _, _, buf, _ = read_response(s, buf)
+        check(st == 200, "pipelined POST+GET, response %d got %d" % (i, st))
+    check(buf == b"", "extra bytes after 2 responses: %r" % buf)
+    s.settimeout(0.4)
+    try:
+        check(s.recv(1) == b"", "a 3rd response arrived for 2 requests")
+    except socket.timeout:
+        pass
+    # Body that looks like a request: must be treated as data, not as a second request.
+    inner = HOST_REQ
+    s = conn()
+    s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % len(inner) + inner)
+    st, _, _, buf, _ = read_response(s)
+    check(st == 200, "POST with a request-shaped body got %d" % st)
+    s.settimeout(0.4)
+    try:
+        extra = s.recv(1)
+        check(extra == b"", "request-shaped body was executed as a 2nd request (smuggling)")
+    except socket.timeout:
+        pass
+
+elif case == "body-split":
+    s = conn(); s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n")
+    time.sleep(0.05)
+    s.settimeout(0.3)
+    try:
+        d = s.recv(1)
+        check(False, "server answered before the body arrived: %r" % d)
+    except socket.timeout:
+        pass
+    for b in b"0123456789":
+        s.sendall(bytes([b])); time.sleep(0.005)
+    st, h, body, rest, _ = read_response(s)
+    check(st == 200, "split body status %d" % st)
+    s.settimeout(0.4)
+    try:
+        extra = s.recv(1)
+        check(extra == b"", "unexpected extra bytes after the single response: %r" % extra)
+    except socket.timeout:
+        pass
+    # Head itself split in the middle of the Content-Length line, then the body.
+    s = conn(); s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    for chunk in (b"POST / HTTP/1.1\r\nHost: x\r\nContent-Le", b"ngth: 3\r\n\r\nab", b"c"):
+        s.sendall(chunk); time.sleep(0.05)
+    st, *_ = read_response(s)
+    check(st == 200, "head split mid-header got %d" % st)
+
+elif case == "body-limit":
+    n = 1 << 20
+    s = conn()
+    s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % n + b"a" * n)
+    st, *_ = read_response(s)
+    check(st == 200, "body of exactly 1 MiB got %d" % st)
+    s.sendall(HOST_REQ)
+    st, *_ = read_response(s)
+    check(st == 200, "request after a 1 MiB body got %d" % st)
+
+elif case == "body-too-large":
+    n = (1 << 20) + 1
+    s = conn()
+    # Head only: the 413 must arrive without a single body byte being sent.
+    s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % n)
+    st, h, *_ = read_response(s)
+    check(st == 413, "1 MiB + 1 declared -> %d, wanted 413" % st)
+    check(h.get("connection", "").lower() == "close", "413 lacks 'Connection: close'")
+    check(closed_by_server(s), "connection stayed open after the 413")
+    s = conn()
+    s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 999999999\r\n\r\n")
+    st, *_ = read_response(s)
+    check(st == 413, "999999999 declared -> %d, wanted 413" % st)
+
+elif case == "body-bad-length":
+    for v in (b"-1", b"+5", b"5 5", b"abc", b"", b"99999999999999999999", b"0x10", b"1.5"):
+        s = conn()
+        s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: " + v + b"\r\n\r\nhello")
+        try:
+            st, h, *_ = read_response(s)
+        except Exception as e:
+            check(False, "Content-Length %r -> no response (%s)" % (v, e))
+        check(st == 400, "Content-Length %r -> %d, wanted 400" % (v, st))
+        check(closed_by_server(s), "Content-Length %r -> connection stayed open" % v)
+    s = conn()   # duplicate Content-Length
+    s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello")
+    st, *_ = read_response(s)
+    check(st == 400, "duplicate Content-Length -> %d, wanted 400" % st)
+
+elif case == "body-te":
+    s = conn()
+    s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+    st, h, *_ = read_response(s)
+    check(st == 501, "Transfer-Encoding: chunked -> %d, wanted 501" % st)
+    check(closed_by_server(s), "connection stayed open after the 501")
+    s = conn()   # TE + CL together is the classic smuggling shape
+    s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    st, *_ = read_response(s)
+    check(st == 501, "Content-Length + Transfer-Encoding -> %d, wanted 501" % st)
+
+elif case == "body-survival":
+    s = conn(); s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nok")
+    st, *_ = read_response(s)
+    check(st == 200, "server no longer answers POST: %d" % st)
+
 sys.exit(0)
 PY
     local rc=$?
@@ -213,6 +357,17 @@ run_case split       "byte-by-byte request gets exactly one response"
 run_case errors      "400/414/431/501/505 + connection closed"
 run_case survival    "server still serving"
 
+# WEB-8: Content-Length bodies.
+run_case body              "POST with a body: 200, keep-alive, next request framed correctly"
+run_case body-zero         "Content-Length: 0 and GET-with-body keep framing intact"
+run_case body-pipelined    "POST + GET in one send -> two 200s; request-shaped body is data"
+run_case body-split        "body byte by byte (and a split head) -> exactly one response"
+run_case body-limit        "a body of exactly 1 MiB is accepted"
+run_case body-too-large    "over the limit -> 413 + close before any body byte is sent"
+run_case body-bad-length   "-1, +5, '5 5', abc, empty, overflow, duplicate -> 400 + close"
+run_case body-te           "Transfer-Encoding (alone or with Content-Length) -> 501 + close"
+run_case body-survival     "server still serving after the body cases"
+
 # Cross-check with curl when available (the ticket's acceptance commands).
 if command -v curl >/dev/null; then
     OUT="$(curl -s -i "http://127.0.0.1:$PORT/")"
@@ -221,6 +376,12 @@ if command -v curl >/dev/null; then
     [[ "$HEADS" == HTTP/1.1\ 200\ OK* ]] && pass "curl -I" || fail "curl -I: $HEADS"
     REUSE="$(curl -sv "http://127.0.0.1:$PORT/" "http://127.0.0.1:$PORT/" 2>&1 >/dev/null | grep -ci 'Re-\?using existing')"
     [[ "$REUSE" -ge 1 ]] && pass "curl reuses the connection" || fail "curl did not reuse the connection"
+    POST_OUT="$(curl -s -i -d 'hello' "http://127.0.0.1:$PORT/")"
+    [[ "$POST_OUT" == HTTP/1.1\ 200\ OK* ]] && pass "curl -d POST" || fail "curl -d POST: $POST_OUT"
+    POST_REUSE="$(curl -sv -d 'hello' "http://127.0.0.1:$PORT/" --next -d 'world' "http://127.0.0.1:$PORT/" 2>&1 >/dev/null | grep -ci 'Re-\?using existing')"
+    [[ "$POST_REUSE" -ge 1 ]] && pass "curl POST reuses the connection" || fail "curl POST did not reuse the connection"
+    BIG_STATUS="$(head -c 2000000 /dev/zero | curl -s -o /dev/null -w '%{http_code}' --data-binary @- "http://127.0.0.1:$PORT/")"
+    [[ "$BIG_STATUS" == 413 ]] && pass "curl 2 MB POST -> 413" || fail "curl 2 MB POST -> $BIG_STATUS (wanted 413)"
 else
     echo "SKIP: curl not installed"
 fi
