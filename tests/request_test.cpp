@@ -95,6 +95,16 @@ TEST(KeepAliveTest, MethodDoesNotAffectDecision)
     EXPECT_TRUE(keepAlive("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"));
 }
 
+TEST(RequestTest, BodyIsViewIntoInputBuffer)
+{
+    std::string raw = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+    const http::ParseOutcome outcome = http::parse(raw);
+    const auto *done = std::get_if<http::Done>(&outcome);
+    ASSERT_NE(done, nullptr);
+    EXPECT_EQ(done->request.body.data(), raw.data() + raw.find("hello"));
+    EXPECT_EQ(done->request.body, "hello");
+}
+
 // ---------- Comma-separated token lists (RFC 9110 7.6.1) ----------
 
 TEST(KeepAliveTest, CloseIsRecognisedInsideTokenList)
