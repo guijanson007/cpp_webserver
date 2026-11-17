@@ -12,6 +12,7 @@
 #include <sys/epoll.h>
 #include "common/Error.h"
 #include "common/ParseNumber.h"
+#include "http/Router.h"
 #include "server/ServerConfig.h"
 
 constexpr int MAX_PORT = 65535;
@@ -77,7 +78,18 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    Server server(configResult.value(), epollReactor);
+    // Configure the router
+    http::Router router;
+    router.add(http::HttpMethod::GET, "/", [](const http::Request &)
+               { return http::Response(http::StatusCode::Ok, "Hello, World!", "Content-Type: text/plain", false); });
+    router.add(http::HttpMethod::POST, "/echo",
+               [](const http::Request &request)
+               {
+                   return http::Response(http::StatusCode::Ok, std::string(request.body), "Content-Type: text/plain",
+                                         false);
+               });
+
+    Server server(configResult.value(), epollReactor, router);
 
     if (auto result = server.start(); !result)
     {
