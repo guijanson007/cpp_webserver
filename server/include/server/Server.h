@@ -25,6 +25,7 @@
 #include <utility>
 #include "http/Parser.h"
 #include "http/Response.h"
+#include "http/Router.h"
 #include "network/Connection.h"
 #include "network/EpollReactor.h"
 #include "network/SocketIo.h"
@@ -33,7 +34,8 @@
 class Server
 {
 public:
-    Server(ServerConfig config, network::EpollReactor &reactor) : m_config(std::move(config)), m_reactor(reactor)
+    Server(ServerConfig config, network::EpollReactor &reactor, http::Router router)
+        : m_config(std::move(config)), m_reactor(reactor), m_router(std::move(router))
     {
         m_clients.reserve(m_config.maxConnections);
     }
@@ -318,7 +320,9 @@ private:
 
                     bool close_conn = !req.shouldKeepAlive();
 
-                    http::Response resp(http::StatusCode::Ok, "Hello, World!", "Content-Type: text/plain", close_conn);
+                    http::Response resp(m_router.route(req));
+                    resp.close_connection = close_conn; // ensure the response respects the connection state
+
                     std::string serialized_resp = resp.serialize();
                     if (req.method == http::HttpMethod::HEAD)
                     {
@@ -356,6 +360,7 @@ private:
     FileDescriptor m_spare_fd; // spare file descriptor to handle EMFILE/ENFILE errors
     std::unordered_map<int, network::Connection> m_clients;
     network::EpollReactor &m_reactor;
+    http::Router m_router;
 };
 
 
