@@ -21,14 +21,14 @@
   - New flags and a `--help` option (README roadmap).
 
 ### Acceptance criteria (Definition of Done)
-- [ ] `build/server/server --port 70000 --max-connections 10` exits with 1 and prints an error that names the argument and the allowed range.
-- [ ] The same happens for `--port 8080abc`, `--port ""`, `--port -1`, `--max-connections 0`, `--max-connections -1` and `--backlog abc`.
-- [ ] `--port 8080 --max-connections 1000 --backlog 128` still starts normally.
-- [ ] Builds clean with no new warnings.
-- [ ] Tests added, named below.
-- [ ] No exceptions needed for control flow on the new path. Parse failures return `Result<T, Error>` or similar, and `main` prints the error. (Exceptions at startup are allowed, but the `Result` convention is preferred.)
-- [ ] No leftover `DELETE` or `asm-generic` references (`grep` returns nothing).
-- [ ] Small, focused commits, each with `WEB-9` in the message.
+- [x] `build/server/server --port 70000 --max-connections 10` exits with 1 and prints an error that names the argument and the allowed range.
+- [x] The same happens for `--port 8080abc`, `--port ""`, `--port -1`, `--max-connections 0`, `--max-connections -1` and `--backlog abc`.
+- [x] `--port 8080 --max-connections 1000 --backlog 128` still starts normally.
+- [x] Builds clean with no new warnings.
+- [x] Tests added, named below.
+- [x] No exceptions needed for control flow on the new path. Parse failures return `Result<T, Error>` or similar, and `main` prints the error. (Exceptions at startup are allowed, but the `Result` convention is preferred.)
+- [x] No leftover `DELETE` or `asm-generic` references (`grep` returns nothing).
+- [x] Small, focused commits, each with `WEB-9` in the message.
 
 ### Technical notes / hints
 - `std::from_chars` (`<charconv>`) is the same tool the parser already uses for `Content-Length`. It reports both failure and "stopped early" through `ptr` and `ec`. Check that `ptr == end` to reject trailing garbage.
@@ -55,3 +55,25 @@ Blocks: nothing hard. A warning-flags and `[[nodiscard]]` ticket (WEB-10) and M3
 
 ### Interview talking point
 "Parse, don't validate: untrusted input is converted into a typed, range-checked value at the boundary (`from_chars` plus an end-pointer check), so the rest of the program never sees an invalid port."
+
+## Findings
+- `parseArguments` returns `Result<ServerConfig, std::string>`; the number parsing lives in
+  `common/ParseNumber.h` (`parseInteger<T>(str, min, max)`), so it is unit-testable.
+- `scripts/check_args.sh` on a build of `main` (stoi): 19 failures (e.g. `--port 70000` and
+  `--port 8080abc` kept the server running). On a draft where the `--port` branch returned the bare
+  parser message it caught 9 failures (the message did not name the option); fixed before merge.
+- Still open (not part of this ticket): `EpollReactor` is constructed before argument parsing and
+  can throw outside any handler.
+
+## Verification (fresh build, `web-9`)
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build   # no warnings
+ctest --test-dir build --output-on-failure
+  100% tests passed, 0 tests failed out of 142   (1 disabled: KeepAliveTest.RepeatedConnectionHeadersAreCombined)
+scripts/check_args.sh              ALL CHECKS PASSED
+scripts/check_http.sh              All HTTP checks passed.
+scripts/check_connection_limit.sh  All checks passed.
+scripts/check_reactor.sh           All executed checks passed.
+scripts/check_write_path.sh        All write-path checks passed.
+scripts/check_scale.sh             All checks passed.
+```
