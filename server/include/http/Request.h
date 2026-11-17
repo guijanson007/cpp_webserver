@@ -12,7 +12,6 @@ namespace http
     {
         GET,
         POST,
-        DELETE,
         HEAD,
     };
 
