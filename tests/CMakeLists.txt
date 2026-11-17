@@ -20,6 +20,7 @@ add_executable(common_tests
     response_test.cpp
     request_test.cpp
     parse_number_test.cpp
+    router_test.cpp
 )
 # SocketIo.h is header-only and lives next to the server sources.
 target_include_directories(common_tests PRIVATE ${PROJECT_SOURCE_DIR}/server/include)
