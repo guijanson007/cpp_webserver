@@ -174,16 +174,16 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
-  WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
+  WEB-9 (done: strict argument parsing, `check_args.sh`). Before that WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
   parsing, body section in `check_http.sh`). Next: M3 (router + static files) after, or together with,
-  a small cleanup ticket (argument validation, `[[nodiscard]] Result`, warning flags).
+  a small cleanup ticket (`[[nodiscard]] Result`, warning flags).
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
-  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_http.sh` (WEB-7/WEB-8: GET/HEAD,
+  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_args.sh` (WEB-9: CLI validation), `check_http.sh` (WEB-7/WEB-8: GET/HEAD,
   keep-alive, HTTP/1.0, pipelining, error statuses, POST bodies, 413, curl). `check_write_path.sh` and `check_scale.sh`
-  speak HTTP now (backpressure = 100k pipelined requests). All pass on `web-8`.
+  speak HTTP now (backpressure = 100k pipelined requests). All pass on `web-9`.
   Scripts count connections with `ss`, not server logs. Pass `--max-connections` explicitly.
-- Unit tests: `ctest --test-dir build --output-on-failure` (133 tests run on `web-8`, 1 of
+- Unit tests: `ctest --test-dir build --output-on-failure` (142 tests run on `web-9`, 1 of
   them `DISABLED_`: repeated `Connection` headers). Add a test with every new parser/router/buffer
   unit; `SocketIo` tests use `socketpair`; parser, response and keep-alive tests are socket-free.
 
@@ -255,14 +255,14 @@ Fixed (WEB-8): `Content-Length` bodies framed (a POST body used to be parsed as 
 `clientCallback` checks the `readAllAvailable` result before parsing, +11 tests, 9 body checks and
 curl POST checks in `check_http.sh`.
 
+Fixed (WEB-9): strict argument parsing (`common/ParseNumber.h`, ranges, exit 1), `check_args.sh`,
+leftover `asm-generic` include and `HttpMethod::DELETE` removed, +9 tests.
+
 Open:
 
-- Argument parsing: `std::stoi` accepts trailing garbage and there are no range checks
-  for port, cap or backlog.
 - `EMFILE` message prints on every discard (rate-limit or drop).
 - `MAX_EVENTS` is 10'000, a guess. Settle by profiling.
-- Leftover include (`<asm-generic/socket.h>` in `Server.h`); `accept4` is still called
-  directly in `Server` (outside the wrapper layer).
+- `accept4` is still called directly in `Server` (outside the wrapper layer).
 - `Result` is not `[[nodiscard]]` (callers use `static_cast<void>(flush(...))`);
   `error()` on a successful `Result<void>`
   is undefined behavior; `Error(errno != 0 ? errno : EIO)` fallbacks after `modify()`.
@@ -275,14 +275,11 @@ Open:
   close anyway.
 - `ParseError` duplicates `StatusCode` (and lists codes the parser never returns); `Server` casts
   between them.
-- `HttpMethod::DELETE` is in the enum but the parser never returns it (501); remove it.
-- Argument parsing review (verified): `--port 70000` binds 4464 while printing 70000,
-  `--max-connections -1` starts and sheds every client.
 - `EpollReactor` dispatches by fd number from a fetched batch: a stale event can reach a new
   connection that reused the fd in the same batch (use a generation id in `epoll_event.data`).
 - `flush()` reads `errno` after `closeClientConnection()`; return the `Result` error from
   `modify()` instead. The write buffer has no cap (a non-reading client grows it).
-- `EpollReactor` constructor throws outside `main`'s `try`; warning flags exist only on the
+- `EpollReactor` constructor can throw and `main` does not catch it; warning flags exist only on the
   test target.
 - `Server::clientCallback` does `buf.erase(0, consumed_bytes)` per pipelined request: quadratic on big
   bursts (the 100k-request backpressure case in `check_write_path.sh` costs ~4 s of CPU). Profiling
