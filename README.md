@@ -235,20 +235,20 @@ Planned: the router in `server/include/http/` and `docs/PERFORMANCE.md`.
 
 ## Progress
 
-### Estimated completion: 50%
+### Estimated completion: 54%
 
 ```
-[##########..........]  50%   (17 of 34 required items)
+[###########.........]  54%   (20 of 37 required items)
 ```
 
-How it is computed: the checklist below has 34 required items across milestones M1-M5.
+How it is computed: the checklist below has 37 required items across milestones M1-M5.
 Each counts equally. M6 is optional and excluded. This is a rough measure of item count,
 not effort. The HTTP parser and the benchmarking work are likely heavier than the
 average done item, so real progress is probably a bit lower.
 
 ### Built
 
-**M1: Reactor cleanup (done)**
+**M1: Reactor cleanup (done, 8/8)**
 
 - [x] `EpollReactor` class, with epoll logic out of `main`
 - [x] `constexpr` constants instead of `#define`
@@ -257,6 +257,7 @@ average done item, so real progress is probably a bit lower.
 - [x] Write path: per-connection output buffer, `EPOLLOUT` armed on `EAGAIN`, disarmed on drain
 - [x] Configurable connection cap and backlog (`ServerConfig` and CLI flags)
 - [x] `EMFILE`/`ENFILE` handling, 10k idle connections verified
+- [x] Strict command-line validation: `--port` 1-65535, cap and backlog >= 1, exit 1 on bad input (WEB-9)
 
 **M2 (partial): HTTP core, request head (WEB-6)**
 
@@ -284,11 +285,12 @@ average done item, so real progress is probably a bit lower.
 - [x] Unit tests for `Error`, `Result` and `SocketIo` (26 tests)
 - [x] Parser unit tests (split at every offset, size limits, malformed input, bodies)
 - [x] Response and keep-alive unit tests (`ResponseTest`, `ReasonPhraseTest`, `KeepAliveTest`)
+- [x] `parseInteger` unit tests (`ParseNumberTest`, 9 tests) and `check_args.sh` (WEB-9)
 
 Also done and not counted separately: `Result<T, Error>` error handling with concept
 constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end check scripts
-(the older ones ported to HTTP, plus `check_args.sh` for CLI validation), 431/414 size limits in the parser, HTTP/1.0 and
-`Connection` token-list handling, strict `from_chars` argument parsing (`parseInteger`, WEB-9).
+(the older ones ported to HTTP, plus `check_args.sh`), 431/414 size limits in the parser, HTTP/1.0 and
+`Connection` token-list handling.
 
 ### Planned
 
@@ -306,7 +308,7 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end che
 - [ ] Keep-alive state machine (keep-alive decision and reuse work; idle timeouts do not)
 - [ ] Idle timeouts without a thread per connection
 
-**M4: Quality (3/8 done, the three done items are listed above)**
+**M4: Quality (5/10 done, the five done items are listed above)**
 
 - [ ] Router unit tests
 - [ ] Buffer unit tests
