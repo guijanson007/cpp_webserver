@@ -107,14 +107,15 @@ server/include/network/Connection.h      client fd + read/write buffers
 server/include/http/Request.h            Request (string_views into the read buffer), SizeLimits, iequals
 server/include/http/Parser.h             http::parse(): stateless request-head parser, ParseError
 server/include/http/Response.h           Response::serialize(), StatusCode, reason phrases
+server/include/http/Router.h             RequestHandler concept, Router (exact path, 404/405, HEAD->GET)
 server/include/server/Server.h           listener, accept loop, client table, clientCallback
 server/src/main.cpp                      wiring only
-tests/                                   GoogleTest (FetchContent): error, result, socketio, parser, response, request (keep-alive) tests
+tests/                                   GoogleTest (FetchContent): error, result, socketio, parser, response, request (keep-alive), router tests
 scripts/check_*.sh                       WEB-1..WEB-4 and WEB-7 checks (see Workflow conventions)
 docs/tickets/WEB-<n>.md                  tickets from /next_task
 ```
 
-## Current architecture (after WEB-8)
+## Current architecture (after WEB-10)
 
 - `EpollReactor` is a dumb dispatcher: `add(fd, events, handler)`, `modify`, `remove`,
   `run()` (one `epoll_wait` pass). All four return `Result<void>`. Handlers are
@@ -165,6 +166,12 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
   error status with `Connection: close`, `setReadClosed(true)`, stops (rest of the buffer is dropped).
   One `flush()` per wakeup closes a read-closed connection once the output drains. Pipelining works
   because the loop runs until `NeedMore`. There is no router yet (M3); every request gets the same body.
+- `http::Router` (WEB-10): `add(HttpMethod, path, RequestHandler)` (concept: `Response(const Request&)`),
+  `route(const Request&) -> Response`. Exact path with the query string stripped, no percent-decoding.
+  Unknown path 404, wrong method 405 + `Allow`, HEAD falls back to the GET handler. Routes live in
+  `unordered_map<string, array<optional<function>, MAX_METHODS>>` with transparent lookup. `Server`
+  owns a `Router` passed in by `main` (demo routes `GET /`, `POST /echo`), and `clientCallback` sets
+  `resp.close_connection` from `shouldKeepAlive()` after routing. Handlers return owning `Response`s.
 - `Connection` owns its `FileDescriptor` and read buffer. Closing = `reactor.remove(fd)`
   then erase from the map (the destructor closes the fd; never call raw `close` on an
   fd a `Connection` owns).
@@ -174,8 +181,8 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
-  WEB-9 (done: strict argument parsing, `check_args.sh`). Before that WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
-  parsing, body section in `check_http.sh`). Next: M3 (router + static files) after, or together with,
+  WEB-10 (done: router, 404/405, routing section in `check_http.sh`). Before that WEB-9 (done: strict argument parsing, `check_args.sh`). Before that WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
+  parsing, body section in `check_http.sh`). Next: M3 static files + MIME + traversal protection, then idle timeouts, after, or together with,
   a small cleanup ticket (`[[nodiscard]] Result`, warning flags).
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
