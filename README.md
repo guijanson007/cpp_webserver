@@ -6,10 +6,10 @@ tested and benchmarked server where every design decision is backed by profiling
 
 > **Status: work in progress.** The networking core (reactor, non-blocking I/O, write
 > path, connection limits, error handling) is done, and the server now speaks HTTP/1.1
-> requests: it parses heads and `Content-Length` bodies (413 over 1 MiB), answers with a
-> fixed `200 OK` (or a 4xx/5xx error), and supports keep-alive, pipelining and `HEAD`.
-> There is no router and no static files yet, so every successful request gets the same
-> `Hello, World!` body and the request body is ignored. See [Progress](#progress).
+> requests: it parses heads and `Content-Length` bodies (413 over 1 MiB), dispatches
+> them through a small router (exact paths, 404, 405 with `Allow`), and supports keep-alive,
+> pipelining and `HEAD`. There are no static files yet: the only routes are demo routes
+> (`GET /` and `POST /echo`). See [Progress](#progress).
 
 ## Platform and design decisions
 
@@ -41,7 +41,7 @@ tested and benchmarked server where every design decision is backed by profiling
                  +---------------v---------------+
                  |  Server                       |  accept loop, connection table,
                  |  unordered_map<fd, Connection>|  connection cap, EMFILE handling,
-                 |                               |  parse -> respond loop per wakeup
+                 |                               |  parse -> route -> respond per wakeup
                  +-------+---------------+-------+
                          |               |
          +---------------v-----+   +-----v---------------------------+
@@ -49,11 +49,11 @@ tested and benchmarked server where every design decision is backed by profiling
          |  FileDescriptor,    |   |  parse(buffer, limits)          |
          |  read/write buffers |   |    -> Done{Request, consumed}   |
          +---------------+-----+   |     | NeedMore | ParseError    |
-                         |         |  Request::shouldKeepAlive()     |
-         +---------------v-----+   |  Response{...}.serialize()      |
-         |  SocketIo           |   +---------------------------------+
-         |  readAllAvailable / |
-         |  writeSome (Result) |
+                         |         |  Router::route(Request)         |
+         +---------------v-----+   |    -> Response (200/404/405)    |
+         |  SocketIo           |   |  Request::shouldKeepAlive()     |
+         |  readAllAvailable / |   |  Response{...}.serialize()      |
+         |  writeSome (Result) |   +---------------------------------+
          +---------------------+
 ```
 
@@ -70,6 +70,7 @@ tested and benchmarked server where every design decision is backed by profiling
 | `http::parse` | `server/include/http/Parser.h` | Stateless, incremental request parser (head and `Content-Length` body). Returns a `std::variant<Done, NeedMore, ParseError>`. `Done` holds a `Request` plus `consumed_bytes`. |
 | `Request` | `server/include/http/Request.h` | `string_view`s into the read buffer (method, target, version, raw headers, body) with a case-insensitive `getHeaderValue()` and `shouldKeepAlive()`. Also `SizeLimits`. |
 | `Response` | `server/include/http/Response.h` | Status, body and extra headers. `serialize()` always emits `Content-Length`, plus `Connection: close` when asked. `StatusCode` and `statusCodeToReasonPhrase()` live here. |
+| `Router` | `server/include/http/Router.h` | Exact-path router. `add(method, path, handler)` takes anything satisfying the `RequestHandler` concept (`Response(const Request&)`). `route()` strips the query string, returns 404 for an unknown path, 405 with `Allow` for a wrong method, and lets HEAD use the GET handler. |
 | `Server` | `server/include/server/` | Listener, accept loop, connection table, cap enforcement, `EMFILE` handling, and the per-connection parse and respond loop. |
 | `ServerConfig` | `server/include/server/` | `ip`, `port`, `maxConnections`, `backlogSize`. |
 
@@ -92,8 +93,9 @@ tested and benchmarked server where every design decision is backed by profiling
 - **Loop.** After each drain of the socket, `Server` calls `http::parse` repeatedly on the
   read buffer. `Done` queues a response and drops the consumed bytes, `NeedMore` waits for
   the next read, and a `ParseError` queues an error response and stops.
-- **Responses.** Every parsed request gets `200 OK` with a `text/plain` `Hello, World!`
-  body. `HEAD` gets the same headers (including `Content-Length`) and no body.
+- **Responses.** Every parsed request goes through `Router::route` (WEB-10). `HEAD` gets the
+  same headers as the GET handler (including `Content-Length`) and no body. The server sets
+  `Connection: close` on the response when the connection will close.
 - **Pipelining.** Several requests in one read are answered in order, and the output is
   flushed once.
 - **Keep-alive.** `Request::shouldKeepAlive()`: HTTP/1.1 stays open unless `Connection`
@@ -103,6 +105,20 @@ tested and benchmarked server where every design decision is backed by profiling
 - **Errors.** A `ParseError` becomes the response status with `Connection: close`. The
   connection is marked read-closed, so `flush()` closes it after the buffer drains, and any
   bytes after the bad request are dropped.
+
+### Routing (WEB-10)
+
+- **Matching.** Exact, case-sensitive path match on the request target with the query string
+  (`?...`) stripped. No percent-decoding, wildcards or path parameters (roadmap).
+- **Statuses.** Unknown path: 404. Known path, method not registered: 405 with `Allow`
+  (`GET, HEAD` when a GET handler exists). `HEAD` falls back to the `GET` handler, and the
+  server drops the body bytes. 404 and 405 carry `Connection: close` only when the client
+  asked to close.
+- **Handlers.** Constrained by the `RequestHandler` concept, so lambdas and function pointers
+  are accepted and anything else fails at the call site with a readable error. They are stored
+  as `std::function`. Handlers must return an owning `Response`, because the `Request` views
+  die when the server drops the parsed bytes.
+- **Demo routes.** `main` registers `GET /` (`Hello, World!`) and `POST /echo` (returns the body).
 
 ### HTTP parser behaviour
 
@@ -133,11 +149,11 @@ tested and benchmarked server where every design decision is backed by profiling
 - Hand-written, incremental parser over `std::string_view`, zero-copy. No llhttp or
   http-parser. **Done for the request line and headers, and wired into the server.**
 - Request-line, header and body size limits (414, 431 and 413 done).
-- Status codes: 400, 404, 405, 413, 431, 500 (404 and 405 need the router).
+- Status codes: 400, 404, 405, 413, 431, 500 (all but 500 are returned today).
 - `Content-Length` request bodies. **Done.**
 - Keep-alive with idle timeouts.
 - Static files with MIME types and path-traversal protection.
-- Concept-constrained router.
+- Concept-constrained router. **Done (exact paths).**
 
 Roadmap only (documented, not built): chunked transfer encoding, `Range` requests, gzip,
 libFuzzer fuzzing of the parser, a load-generator client.
@@ -181,17 +197,20 @@ build/server/server --port 8080 --max-connections 1000 --backlog 10000
 ```sh
 curl -v http://localhost:8080/        # 200 OK, "Hello, World!"
 curl -I http://localhost:8080/        # same headers, no body
+curl -d hello http://localhost:8080/echo     # 200, body "hello"
+curl -i http://localhost:8080/nope           # 404
+curl -i -X POST http://localhost:8080/       # 405, Allow: GET, HEAD
 printf 'FOO / HTTP/1.1\r\nHost: x\r\n\r\n' | nc localhost 8080   # 501, then the connection closes
 ```
 
 Arguments are parsed strictly: trailing garbage, signs, empty values, overflow and out-of-range
 numbers make the server print an error and exit with status 1.
 
-Every request currently gets the same fixed response. Routing and static files come in M3.
+Only the demo routes exist (`GET /`, `POST /echo`). Static files come next in M3.
 
 ## Test
 
-Unit tests use GoogleTest and live in a single target, `common_tests` (133 tests, 1 disabled
+Unit tests use GoogleTest and live in a single target, `common_tests` (156 tests, 1 disabled
 known-gap test):
 
 ```sh
@@ -199,6 +218,7 @@ ctest --test-dir build --output-on-failure          # everything
 build/tests/common_tests --gtest_filter='SocketIo*' # one suite or test
 build/tests/common_tests --gtest_filter='Parser*'   # HTTP parser tests
 build/tests/common_tests --gtest_filter='Response*:ReasonPhrase*:KeepAlive*'   # WEB-7 tests
+build/tests/common_tests --gtest_filter='RouterTest*'   # WEB-10 tests
 ```
 
 Add new test files to the `common_tests` source list in `tests/CMakeLists.txt`.
@@ -216,7 +236,7 @@ These start the server themselves. Each takes `[server-binary] [port]` and defau
 | `scripts/check_reactor.sh` | Reactor behaviour (uses `strace` and `ss`). |
 | `scripts/check_write_path.sh` | Pipelined responses, RST survival, backpressure (100k pipelined requests, ~8 MB out), half-close flush, `EPOLLOUT` armed only when needed. |
 | `scripts/check_scale.sh` | The cap, 10k idle connections, fd exhaustion. |
-| `scripts/check_http.sh` | GET, HEAD, keep-alive, HTTP/1.0, `Connection: close`, pipelining, byte-by-byte requests, 400/414/431/501/505 followed by close, POST bodies (framing, pipelining, split, 1 MiB limit, 413 before the body, bad lengths, `Transfer-Encoding`), `curl` GET and POST. |
+| `scripts/check_http.sh` | GET, HEAD, keep-alive, HTTP/1.0, `Connection: close`, pipelining, byte-by-byte requests, 400/414/431/501/505 followed by close, POST bodies (framing, pipelining, split, 1 MiB limit, 413 before the body, bad lengths, `Transfer-Encoding`), `curl` GET and POST, and routing (404, 405 + `Allow`, HEAD fallback, `/echo`, query string, `Connection: close` on errors). |
 
 The scripts count connections with `ss`, not server logs.
 
@@ -231,17 +251,17 @@ scripts/       end-to-end check scripts
 docs/tickets/  one ticket per unit of work (WEB-<n>)
 ```
 
-Planned: the router in `server/include/http/` and `docs/PERFORMANCE.md`.
+Planned: `docs/PERFORMANCE.md`.
 
 ## Progress
 
-### Estimated completion: 54%
+### Estimated completion: 61%
 
 ```
-[###########.........]  54%   (20 of 37 required items)
+[############........]  61%   (23 of 38 required items)
 ```
 
-How it is computed: the checklist below has 37 required items across milestones M1-M5.
+How it is computed: the checklist below has 38 required items across milestones M1-M5.
 Each counts equally. M6 is optional and excluded. This is a rough measure of item count,
 not effort. The HTTP parser and the benchmarking work are likely heavier than the
 average done item, so real progress is probably a bit lower.
@@ -275,12 +295,15 @@ average done item, so real progress is probably a bit lower.
 - [x] `Content-Length` bodies (strict parsing, resumable across partial reads, pipelining-safe)
 - [x] Size limits: 414, 431 and 413 (body over `maxBodySize` refused from the head alone)
 
-**M3 (partial)**
+**M3 (partial): routing (WEB-10)**
 
 - [x] Placeholder echo protocol removed
+- [x] Concept-constrained router (`http::Router`, 404/405 with `Allow`, HEAD fallback, query stripped)
+- [x] Routing end-to-end checks in `check_http.sh` (8 cases plus curl checks)
 
 **M4 (partial): Quality foundations**
 
+- [x] Router unit tests (`RouterTest`, 13 tests plus concept `static_assert`s) (WEB-10)
 - [x] GoogleTest wired in through `FetchContent`
 - [x] Unit tests for `Error`, `Result` and `SocketIo` (26 tests)
 - [x] Parser unit tests (split at every offset, size limits, malformed input, bodies)
@@ -296,21 +319,19 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end che
 
 **M2: HTTP core (6/7 done, listed above)**
 
-- [ ] Status codes 400, 404, 405, 413, 431, 500 (400, 413, 414, 431, 501, 505 are returned
-  today; 404 and 405 need the router, 500 needs a handler that can fail)
+- [ ] Status codes 400, 404, 405, 413, 431, 500 (400, 404, 405, 413, 414, 431, 501, 505 are
+  returned today; 500 needs a handler that can fail)
 
-**M3: Routing and static files (1/7)**
+**M3: Routing and static files (3/8, done items listed above)**
 
-- [ ] Concept-constrained router
 - [ ] Static file serving
 - [ ] MIME type table
 - [ ] Path-traversal protection
 - [ ] Keep-alive state machine (keep-alive decision and reuse work; idle timeouts do not)
 - [ ] Idle timeouts without a thread per connection
 
-**M4: Quality (5/10 done, the five done items are listed above)**
+**M4: Quality (6/10 done, the six done items are listed above)**
 
-- [ ] Router unit tests
 - [ ] Buffer unit tests
 - [ ] GitHub Actions CI (GCC and Clang)
 - [ ] ASan and UBSan builds
@@ -332,13 +353,13 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end che
 
 **Known cleanups (small tickets)**
 
-- [ ] Strict argument parsing (`std::stoi` accepts trailing garbage, no range checks)
+- [x] Strict argument parsing (WEB-9)
 - [ ] Rate-limit the `EMFILE` log message
 - [ ] Move the direct `accept4` call behind the wrapper layer
 - [ ] Mark `Result` `[[nodiscard]]`
 - [ ] Bound reads per wakeup so one fast sender cannot starve others
 - [ ] Cap the per-connection write buffer
-- [ ] Remove the unused `HttpMethod::DELETE`
+- [x] Remove the unused `HttpMethod::DELETE` (WEB-9)
 - [ ] Combine repeated `Connection` headers in `Request::shouldKeepAlive` (RFC 9110 §5.3):
   `Connection: TE` followed by `Connection: close` is read as keep-alive today, because
   `getHeaderValue` returns only the first match. Enable
