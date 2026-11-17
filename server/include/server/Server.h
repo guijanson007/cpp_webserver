@@ -7,7 +7,6 @@
 
 
 #include <arpa/inet.h>
-#include <asm-generic/socket.h>
 #include <cerrno>
 #include <common/FileDescriptor.h>
 #include <cstdint>

@@ -10,11 +10,17 @@
 #include <network/EpollReactor.h>
 #include <server/Server.h>
 #include <sys/epoll.h>
+#include "common/Error.h"
+#include "common/ParseNumber.h"
 #include "server/ServerConfig.h"
 
-ServerConfig parseArguments(int argc, char *argv[])
+constexpr int MAX_PORT = 65535;
+constexpr int MIN_PORT = 1;
+constexpr int MIN_CONNECTIONS = 1;
+constexpr int MIN_BACKLOG = 1;
+
+Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
 {
-    // Start with default values
     ServerConfig config{};
 
     for (int i = 1; i < argc; ++i)
@@ -23,22 +29,36 @@ ServerConfig parseArguments(int argc, char *argv[])
 
         if (arg == "--port" && i + 1 < argc)
         {
-            config.port = std::stoi(argv[++i]);
+            auto valRes = parseInteger<int>(argv[++i], MIN_PORT, MAX_PORT);
+            if (!valRes)
+                return std::format("Invalid port: {}", valRes.error());
+
+            config.port = valRes.value();
         }
         else if (arg == "--max-connections" && i + 1 < argc)
         {
-            config.maxConnections = std::stoi(argv[++i]);
+            auto valRes = parseInteger<int>(argv[++i], MIN_CONNECTIONS);
+            if (!valRes)
+                return std::format("Invalid max connections: {}", valRes.error());
+
+            config.maxConnections = valRes.value();
         }
         else if ((arg == "--backlog" || arg == "--backlog-size") && i + 1 < argc)
         {
-            config.backlogSize = std::stoi(argv[++i]);
+            auto valRes = parseInteger<int>(argv[++i], MIN_BACKLOG);
+            if (!valRes)
+                return std::format("Invalid backlog size: {}", valRes.error());
+
+            config.backlogSize = valRes.value();
         }
         else
         {
-            throw std::invalid_argument("Unknown or incomplete argument: " + arg);
+            std::string errorMsg = std::format("Unknown or incomplete argument: {}", arg);
+            errorMsg += "\nUsage: " + std::string(argv[0]) +
+                        " [--port <port>] [--max-connections <max_connections>] [--backlog <backlog_size>]";
+            return errorMsg;
         }
     }
-
     return config;
 }
 
@@ -49,19 +69,15 @@ int main(int argc, char *argv[])
 
     network::EpollReactor epollReactor; // might throw (expected if epoll_create1 fails)
 
-    ServerConfig config;
-    try
+    // Exception-free parsing
+    auto configResult = parseArguments(argc, argv);
+    if (!configResult)
     {
-
-        config = parseArguments(argc, argv);
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << std::format("Error parsing arguments: {}", e.what()) << std::endl;
+        std::cerr << std::format("Error parsing arguments: {}\n", configResult.error());
         return EXIT_FAILURE;
     }
 
-    Server server(config, epollReactor);
+    Server server(configResult.value(), epollReactor);
 
     if (auto result = server.start(); !result)
     {

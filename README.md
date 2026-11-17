@@ -174,15 +174,18 @@ build/server/server --port 8080 --max-connections 1000 --backlog 10000
 
 | Flag | Meaning |
 | --- | --- |
-| `--port` | TCP port to listen on. |
-| `--max-connections` | Concurrent connection cap. Pass it explicitly. The built-in default is 100. |
-| `--backlog` (or `--backlog-size`) | `listen()` backlog. Default 10000. |
+| `--port` | TCP port to listen on (1-65535). |
+| `--max-connections` | Concurrent connection cap. Pass it explicitly (>= 1). The built-in default is 100. |
+| `--backlog` (or `--backlog-size`) | `listen()` backlog (>= 1). Default 10000. |
 
 ```sh
 curl -v http://localhost:8080/        # 200 OK, "Hello, World!"
 curl -I http://localhost:8080/        # same headers, no body
 printf 'FOO / HTTP/1.1\r\nHost: x\r\n\r\n' | nc localhost 8080   # 501, then the connection closes
 ```
+
+Arguments are parsed strictly: trailing garbage, signs, empty values, overflow and out-of-range
+numbers make the server print an error and exit with status 1.
 
 Every request currently gets the same fixed response. Routing and static files come in M3.
 
@@ -283,9 +286,9 @@ average done item, so real progress is probably a bit lower.
 - [x] Response and keep-alive unit tests (`ResponseTest`, `ReasonPhraseTest`, `KeepAliveTest`)
 
 Also done and not counted separately: `Result<T, Error>` error handling with concept
-constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, five end-to-end check scripts
-(the older ones ported to HTTP), 431/414 size limits in the parser, HTTP/1.0 and
-`Connection` token-list handling.
+constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end check scripts
+(the older ones ported to HTTP, plus `check_args.sh` for CLI validation), 431/414 size limits in the parser, HTTP/1.0 and
+`Connection` token-list handling, strict `from_chars` argument parsing (`parseInteger`, WEB-9).
 
 ### Planned
 
