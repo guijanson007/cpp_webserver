@@ -3,17 +3,22 @@
 
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string_view>
 
 namespace http
 {
-    enum class HttpMethod
+    static constexpr size_t MAX_METHODS = 3;
+
+    enum class HttpMethod : uint8_t
     {
-        GET,
-        POST,
-        HEAD,
+        GET = 0,
+        POST = 1,
+        HEAD = 2,
     };
+
+    // TODO: Make sure taht the size of the enum matches the MAX_METHODS constant. If adding more methods, update both.
 
     struct SizeLimits
     {
