@@ -14,11 +14,7 @@
 #include "common/ParseNumber.h"
 #include "http/Router.h"
 #include "server/ServerConfig.h"
-
-constexpr int MAX_PORT = 65535;
-constexpr int MIN_PORT = 1;
-constexpr int MIN_CONNECTIONS = 1;
-constexpr int MIN_BACKLOG = 1;
+#include "server/ServerConfigParser.h"
 
 Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
 {
@@ -30,33 +26,44 @@ Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
 
         if (arg == "--port" && i + 1 < argc)
         {
-            auto valRes = parseInteger<int>(argv[++i], MIN_PORT, MAX_PORT);
-            if (!valRes)
-                return std::format("Invalid port: {}", valRes.error());
+            auto port = ServerConfigParser::parsePort(argv[++i]);
+            if (!port)
+                return std::format("Invalid port: {}", port.error());
 
-            config.port = valRes.value();
+            config.port = port.value();
         }
         else if (arg == "--max-connections" && i + 1 < argc)
         {
-            auto valRes = parseInteger<int>(argv[++i], MIN_CONNECTIONS);
-            if (!valRes)
-                return std::format("Invalid max connections: {}", valRes.error());
+            auto maxConnections = ServerConfigParser::parseMaxConnections(argv[++i]);
+            if (!maxConnections)
+                return std::format("Invalid max connections: {}", maxConnections.error());
 
-            config.maxConnections = valRes.value();
+            config.maxConnections = maxConnections.value();
         }
         else if ((arg == "--backlog" || arg == "--backlog-size") && i + 1 < argc)
         {
-            auto valRes = parseInteger<int>(argv[++i], MIN_BACKLOG);
-            if (!valRes)
-                return std::format("Invalid backlog size: {}", valRes.error());
+            auto backlog = ServerConfigParser::parseBacklogSize(argv[++i]);
+            if (!backlog)
+                return std::format("Invalid backlog size: {}", backlog.error());
 
-            config.backlogSize = valRes.value();
+            config.backlogSize = backlog.value();
+        }
+        else if (arg == "--root" && i + 1 < argc)
+        {
+            auto rootDirectory = ServerConfigParser::parseRootDirectory(argv[++i]);
+
+            if (!rootDirectory)
+            {
+                return std::format("Invalid root directory: {}", rootDirectory.error().message());
+            }
+            config.rootDirectory = std::move(rootDirectory.value());
         }
         else
         {
             std::string errorMsg = std::format("Unknown or incomplete argument: {}", arg);
             errorMsg += "\nUsage: " + std::string(argv[0]) +
-                        " [--port <port>] [--max-connections <max_connections>] [--backlog <backlog_size>]";
+                        " [--port <port>] [--max-connections <max_connections>] [--backlog <backlog_size>] [--root "
+                        "<root_directory>]";
             return errorMsg;
         }
     }
