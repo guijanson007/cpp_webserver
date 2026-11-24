@@ -7,6 +7,8 @@
 #   2. range      out-of-range messages show the allowed range (--port: 1-65535)
 #   3. incomplete unknown flag and a flag with no value exit 1
 #   4. accepted   valid values start the server, which answers curl; the printed port is the bound port
+#   5. root       (WEB-11) --root rejects a missing path, a regular file, an empty value, a dangling
+#                 symlink and a missing value, each with the reason on stderr; a valid directory starts
 #
 # Usage: scripts/check_args.sh [server-binary] [port]
 # Defaults: build/server/server, 8080
@@ -24,7 +26,8 @@ pass() { echo "PASS: $*"; }
 ERR="$(mktemp)"
 LOG="$(mktemp)"
 SERVER_PID=""
-trap '[[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null; rm -f "$ERR" "$LOG"' EXIT
+ROOT_TMP="$(mktemp -d)"
+trap '[[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null; rm -f "$ERR" "$LOG"; rm -rf "$ROOT_TMP"' EXIT
 
 # expect_reject <option-word> <args...>: server must exit 1 on its own and complain about <option-word>.
 expect_reject() {
@@ -56,6 +59,15 @@ for v in 0 -1 abc ""; do
     expect_reject backlog --port "$PORT" --max-connections 10 --backlog "$v"
 done
 
+# expect_reject_reason <reason-regex> <args...>: like expect_reject on "root", and stderr must also
+# carry the OS reason (strerror text), not just "invalid".
+expect_reject_reason() {
+    local reason="$1"; shift
+    expect_reject root "$@"
+    if grep -qiE -- "$reason" "$ERR"; then pass "[$*] reason present ($reason)"
+    else fail "[$*] reason missing, expected /$reason/: $(head -c 160 "$ERR" | tr '\n' ' ')"; fi
+}
+
 # 2. the --port message shows the allowed range
 timeout 2 "$SERVER_BIN" --port 70000 --max-connections 10 >"$LOG" 2>"$ERR"
 if grep -q "65535" "$ERR"; then pass "range: --port 70000 message shows the upper bound"
@@ -84,6 +96,23 @@ else
         [[ "$code" == "200" ]] && pass "accepted: curl -> 200" || fail "accepted: curl returned '$code'"
     fi
 fi
+
+# 5. --root (WEB-11)
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+mkdir -p "$ROOT_TMP/www"
+echo hi >"$ROOT_TMP/file.txt"
+ln -s "$ROOT_TMP/gone" "$ROOT_TMP/dangling"
+expect_reject_reason "no such file" --port "$PORT" --max-connections 10 --root "$ROOT_TMP/missing"
+expect_reject_reason "not a directory" --port "$PORT" --max-connections 10 --root "$ROOT_TMP/file.txt"
+expect_reject_reason "invalid" --port "$PORT" --max-connections 10 --root ""
+expect_reject_reason "no such file" --port "$PORT" --max-connections 10 --root "$ROOT_TMP/dangling"
+expect_reject root --port "$PORT" --max-connections 10 --root
+
+"$SERVER_BIN" --port "$PORT" --max-connections 10 --root "$ROOT_TMP/www" >"$LOG" 2>"$ERR" &
+SERVER_PID=$!
+sleep 0.5
+if kill -0 "$SERVER_PID" 2>/dev/null; then pass "root: valid directory starts the server"
+else fail "root: server did not start with --root $ROOT_TMP/www: $(head -c 160 "$ERR")"; fi
 
 echo
 if [[ $FAILS -eq 0 ]]; then echo "ALL CHECKS PASSED"; else echo "$FAILS CHECK(S) FAILED"; exit 1; fi
