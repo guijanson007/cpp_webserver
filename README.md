@@ -7,9 +7,10 @@ tested and benchmarked server where every design decision is backed by profiling
 > **Status: work in progress.** The networking core (reactor, non-blocking I/O, write
 > path, connection limits, error handling) is done, and the server now speaks HTTP/1.1
 > requests: it parses heads and `Content-Length` bodies (413 over 1 MiB), dispatches
-> them through a small router (exact paths, 404, 405 with `Allow`), and supports keep-alive,
-> pipelining and `HEAD`. There are no static files yet: the only routes are demo routes
-> (`GET /` and `POST /echo`). See [Progress](#progress).
+> them through a small router (exact paths, prefix mounts, 404, 405 with `Allow`), serves
+> static files from `--root` under `/static/` with MIME types and kernel-enforced traversal
+> protection, and supports keep-alive, pipelining and `HEAD`. Idle timeouts are next.
+> See [Progress](#progress).
 
 ## Platform and design decisions
 
@@ -53,8 +54,10 @@ tested and benchmarked server where every design decision is backed by profiling
          +---------------v-----+   |    -> Response (200/404/405)    |
          |  SocketIo           |   |  Request::shouldKeepAlive()     |
          |  readAllAvailable / |   |  Response{...}.serialize()      |
-         |  writeSome (Result) |   +---------------------------------+
-         +---------------------+
+         |  writeSome (Result) |   |  StaticFileHandler (/static/)   |
+         +---------------------+   |    -> FileReader: openat2 under |
+                                   |       the root fd (BENEATH)     |
+                                   +---------------------------------+
 ```
 
 ### Components
@@ -70,9 +73,12 @@ tested and benchmarked server where every design decision is backed by profiling
 | `http::parse` | `server/include/http/Parser.h` | Stateless, incremental request parser (head and `Content-Length` body). Returns a `std::variant<Done, NeedMore, ParseError>`. `Done` holds a `Request` plus `consumed_bytes`. |
 | `Request` | `server/include/http/Request.h` | `string_view`s into the read buffer (method, target, version, raw headers, body) with a case-insensitive `getHeaderValue()` and `shouldKeepAlive()`. Also `SizeLimits`. |
 | `Response` | `server/include/http/Response.h` | Status, body and extra headers. `serialize()` always emits `Content-Length`, plus `Connection: close` when asked. `StatusCode` and `statusCodeToReasonPhrase()` live here. |
-| `Router` | `server/include/http/Router.h` | Exact-path router. `add(method, path, handler)` takes anything satisfying the `RequestHandler` concept (`Response(const Request&)`). `route()` strips the query string, returns 404 for an unknown path, 405 with `Allow` for a wrong method, and lets HEAD use the GET handler. |
+| `Router` | `server/include/http/Router.h` | Exact-path router plus prefix mounts. `add(method, path, handler)` and `mount(prefix, handler)` take anything satisfying the `RequestHandler` concept (`Response(const Request&)`). `route()` strips the query string, tries exact routes first, then the longest matching mount (GET/HEAD only), returns 404 for an unknown path, 405 with `Allow` for a wrong method, and lets HEAD use the GET handler. |
+| `StaticFileHandler` | `server/include/http/StaticFileHandler.h` | Serves files under a mount prefix from a root directory fd. Percent-decodes, refuses `.` segments (including `..` and dotfiles), backslash and NUL, then reads through `FileReader`. 404 for anything missing, refused or not a regular file. |
+| `FileReader` | `common/include/common/FileReader.h` | File wrapper layer. `openDirectory()` (`O_PATH`) and `readRegularFileBeneath(dirfd, rel)` (`openat2` with `RESOLVE_BENEATH`, `fstat` + `S_ISREG`). |
+| `MimeTypes` | `server/include/http/MimeTypes.h` | Extension to `Content-Type`, case-insensitive, `application/octet-stream` fallback. |
 | `Server` | `server/include/server/` | Listener, accept loop, connection table, cap enforcement, `EMFILE` handling, and the per-connection parse and respond loop. |
-| `ServerConfig` | `server/include/server/` | `ip`, `port`, `maxConnections`, `backlogSize`. |
+| `ServerConfig` | `server/include/server/` | `ip`, `port`, `maxConnections`, `backlogSize`, `rootDirectory` (optional, required by `main`). `ServerConfigParser` validates each flag. |
 
 ### Behaviour worth knowing
 
@@ -118,7 +124,31 @@ tested and benchmarked server where every design decision is backed by profiling
   are accepted and anything else fails at the call site with a readable error. They are stored
   as `std::function`. Handlers must return an owning `Response`, because the `Request` views
   die when the server drops the parsed bytes.
-- **Demo routes.** `main` registers `GET /` (`Hello, World!`) and `POST /echo` (returns the body).
+- **Mounts (WEB-11).** `mount(prefix, handler)` serves every path under a prefix. Exact routes
+  win over mounts, the longest prefix wins among mounts, and a prefix without a trailing slash
+  only matches on a segment boundary (`/assets` matches `/assets/x`, not `/assetsfoo`). Methods
+  other than GET and HEAD get 405 with `Allow: GET, HEAD`.
+- **Demo routes.** `main` registers `GET /` (`Hello, World!`), `POST /echo` (returns the body)
+  and mounts the static file handler on `/static/`.
+
+### Static files (WEB-11)
+
+- **Root.** `--root <dir>` is required. It is opened once at startup as an `O_PATH` directory fd,
+  so renaming or replacing the directory afterwards does not change what is served.
+- **Traversal protection, two layers.** The handler percent-decodes the path after `/static/`
+  and refuses any segment starting with `.` (so `..`, `.` and dotfiles such as `.git`), a
+  backslash, a NUL byte or a leading `/`. Then the file is opened with
+  `openat2(rootfd, path, RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`: the kernel rejects any
+  resolution that leaves the root (`EXDEV`), including through symlinks, in one lookup, so there
+  is no check-then-open race.
+- **Symlinks.** Relative symlinks that stay inside the root are followed. Absolute symlinks are
+  refused, even when they point inside the root, and so is a link that leaves the root and comes
+  back. Use relative links in a document root.
+- **Responses.** 200 with `Content-Type` from the extension (`.html .css .js .json .txt .png .jpg
+  .jpeg .gif .svg .ico`, case-insensitive, otherwise `application/octet-stream`). Missing files,
+  directories (no `index.html`), FIFOs and refused paths are 404. Malformed percent-encoding is 404.
+- **Limits.** The whole file is read into the response on the reactor thread, with no size cap.
+  `sendfile()` is a profiling question (see the plan below).
 
 ### HTTP parser behaviour
 
@@ -152,8 +182,8 @@ tested and benchmarked server where every design decision is backed by profiling
 - Status codes: 400, 404, 405, 413, 431, 500 (all but 500 are returned today).
 - `Content-Length` request bodies. **Done.**
 - Keep-alive with idle timeouts.
-- Static files with MIME types and path-traversal protection.
-- Concept-constrained router. **Done (exact paths).**
+- Static files with MIME types and path-traversal protection. **Done (WEB-11).**
+- Concept-constrained router. **Done (exact paths and prefix mounts).**
 
 Roadmap only (documented, not built): chunked transfer encoding, `Range` requests, gzip,
 libFuzzer fuzzing of the parser, a load-generator client.
@@ -185,7 +215,7 @@ cmake --build build-release
 ## Run
 
 ```sh
-build/server/server --port 8080 --max-connections 1000 --backlog 10000
+build/server/server --port 8080 --max-connections 1000 --backlog 10000 --root ./www
 ```
 
 | Flag | Meaning |
@@ -193,6 +223,7 @@ build/server/server --port 8080 --max-connections 1000 --backlog 10000
 | `--port` | TCP port to listen on (1-65535). |
 | `--max-connections` | Concurrent connection cap. Pass it explicitly (>= 1). The built-in default is 100. |
 | `--backlog` (or `--backlog-size`) | `listen()` backlog (>= 1). Default 10000. |
+| `--root` | Document root served under `/static/`. Required; must be an existing directory. |
 
 ```sh
 curl -v http://localhost:8080/        # 200 OK, "Hello, World!"
@@ -200,18 +231,21 @@ curl -I http://localhost:8080/        # same headers, no body
 curl -d hello http://localhost:8080/echo     # 200, body "hello"
 curl -i http://localhost:8080/nope           # 404
 curl -i -X POST http://localhost:8080/       # 405, Allow: GET, HEAD
+curl -i http://localhost:8080/static/index.html                  # 200, Content-Type: text/html
+curl -i --path-as-is http://localhost:8080/static/../secret.txt  # 404, never the file
 printf 'FOO / HTTP/1.1\r\nHost: x\r\n\r\n' | nc localhost 8080   # 501, then the connection closes
 ```
 
 Arguments are parsed strictly: trailing garbage, signs, empty values, overflow and out-of-range
-numbers make the server print an error and exit with status 1.
+numbers make the server print an error and exit with status 1. A missing or invalid `--root`
+also exits 1, with the reason (`No such file or directory`, `Not a directory`).
 
-Only the demo routes exist (`GET /`, `POST /echo`). Static files come next in M3.
+Routes: `GET /`, `POST /echo` (demo) and `/static/...` (files from `--root`).
 
 ## Test
 
-Unit tests use GoogleTest and live in a single target, `common_tests` (156 tests, 1 disabled
-known-gap test):
+Unit tests use GoogleTest and live in a single target, `common_tests` (242 tests, 1 of them a
+disabled known-gap test):
 
 ```sh
 ctest --test-dir build --output-on-failure          # everything
@@ -219,11 +253,13 @@ build/tests/common_tests --gtest_filter='SocketIo*' # one suite or test
 build/tests/common_tests --gtest_filter='Parser*'   # HTTP parser tests
 build/tests/common_tests --gtest_filter='Response*:ReasonPhrase*:KeepAlive*'   # WEB-7 tests
 build/tests/common_tests --gtest_filter='RouterTest*'   # WEB-10 tests
+build/tests/common_tests --gtest_filter='Mime*:FileReader*:StaticFileHandler*:RouterMount*:ParseRootDirectory*'   # WEB-11 tests
 ```
 
 Add new test files to the `common_tests` source list in `tests/CMakeLists.txt`.
 `SocketIo` tests use `socketpair`, and the parser, response and keep-alive tests are pure
-functions over strings, so none of them need the network.
+functions over strings, so none of them need the network. The file and static-handler tests
+build a fresh temp directory per test.
 
 ### End-to-end check scripts
 
@@ -236,15 +272,17 @@ These start the server themselves. Each takes `[server-binary] [port]` and defau
 | `scripts/check_reactor.sh` | Reactor behaviour (uses `strace` and `ss`). |
 | `scripts/check_write_path.sh` | Pipelined responses, RST survival, backpressure (100k pipelined requests, ~8 MB out), half-close flush, `EPOLLOUT` armed only when needed. |
 | `scripts/check_scale.sh` | The cap, 10k idle connections, fd exhaustion. |
-| `scripts/check_http.sh` | GET, HEAD, keep-alive, HTTP/1.0, `Connection: close`, pipelining, byte-by-byte requests, 400/414/431/501/505 followed by close, POST bodies (framing, pipelining, split, 1 MiB limit, 413 before the body, bad lengths, `Transfer-Encoding`), `curl` GET and POST, and routing (404, 405 + `Allow`, HEAD fallback, `/echo`, query string, `Connection: close` on errors). |
+| `scripts/check_http.sh` | GET, HEAD, keep-alive, HTTP/1.0, `Connection: close`, pipelining, byte-by-byte requests, 400/414/431/501/505 followed by close, POST bodies (framing, pipelining, split, 1 MiB limit, 413 before the body, bad lengths, `Transfer-Encoding`), `curl` GET and POST, routing (404, 405 + `Allow`, HEAD fallback, `/echo`, query string, `Connection: close` on errors), and static files (byte-exact bodies, MIME types, HEAD, 404s, 29 traversal and symlink-escape targets over raw sockets, 405, pipelining). |
+| `scripts/check_args.sh` | Command-line validation: bad `--port`, `--max-connections`, `--backlog` and `--root` values exit 1 with the reason; valid values start the server. |
 
-The scripts count connections with `ss`, not server logs.
+The scripts count connections with `ss`, not server logs. All of them start the server with a
+temporary `--root`.
 
 ## Repository layout
 
 ```
-common/        shared utilities: FileDescriptor, Error, Result
-server/        reactor, sockets, connection handling, HTTP parser (http/), main
+common/        shared utilities: FileDescriptor, Error, Result, ParseNumber, FileReader
+server/        reactor, sockets, connection handling, HTTP parser, router, static files (http/), main
 client/        small client (a load generator is roadmap only)
 tests/         GoogleTest unit tests
 scripts/       end-to-end check scripts
@@ -255,13 +293,13 @@ Planned: `docs/PERFORMANCE.md`.
 
 ## Progress
 
-### Estimated completion: 61%
+### Estimated completion: 71%
 
 ```
-[############........]  61%   (23 of 38 required items)
+[##############......]  71%   (30 of 42 required items)
 ```
 
-How it is computed: the checklist below has 38 required items across milestones M1-M5.
+How it is computed: the checklist below has 42 required items across milestones M1-M5.
 Each counts equally. M6 is optional and excluded. This is a rough measure of item count,
 not effort. The HTTP parser and the benchmarking work are likely heavier than the
 average done item, so real progress is probably a bit lower.
@@ -301,6 +339,15 @@ average done item, so real progress is probably a bit lower.
 - [x] Concept-constrained router (`http::Router`, 404/405 with `Allow`, HEAD fallback, query stripped)
 - [x] Routing end-to-end checks in `check_http.sh` (8 cases plus curl checks)
 
+**M3 (partial): static files (WEB-11)**
+
+- [x] Static file serving (`StaticFileHandler` mounted on `/static/`, root fd, 404 for non-regular files)
+- [x] MIME type table (11 extensions, case-insensitive, `application/octet-stream` fallback)
+- [x] Path-traversal protection (`.` segments, backslash and NUL refused; `openat2` with `RESOLVE_BENEATH`)
+- [x] Router prefix mounts (`Router::mount`, exact beats prefix, longest prefix wins, segment boundary)
+- [x] Required `--root` flag, validated with the OS reason in the error (`ServerConfigParser`)
+- [x] Static-file end-to-end checks in `check_http.sh` (10 cases, 29 traversal targets, curl checks) and `--root` cases in `check_args.sh`
+
 **M4 (partial): Quality foundations**
 
 - [x] Router unit tests (`RouterTest`, 13 tests plus concept `static_assert`s) (WEB-10)
@@ -309,6 +356,8 @@ average done item, so real progress is probably a bit lower.
 - [x] Parser unit tests (split at every offset, size limits, malformed input, bodies)
 - [x] Response and keep-alive unit tests (`ResponseTest`, `ReasonPhraseTest`, `KeepAliveTest`)
 - [x] `parseInteger` unit tests (`ParseNumberTest`, 9 tests) and `check_args.sh` (WEB-9)
+- [x] Static file unit tests: `MimeTest` (8), `FileReaderTest` (22), `StaticFileHandlerTest` (33),
+  `RouterMountTest` (13), `ParseRootDirectoryTest` (10) (WEB-11)
 
 Also done and not counted separately: `Result<T, Error>` error handling with concept
 constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end check scripts
@@ -322,15 +371,12 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end che
 - [ ] Status codes 400, 404, 405, 413, 431, 500 (400, 404, 405, 413, 414, 431, 501, 505 are
   returned today; 500 needs a handler that can fail)
 
-**M3: Routing and static files (3/8, done items listed above)**
+**M3: Routing and static files (9/11, done items listed above)**
 
-- [ ] Static file serving
-- [ ] MIME type table
-- [ ] Path-traversal protection
 - [ ] Keep-alive state machine (keep-alive decision and reuse work; idle timeouts do not)
 - [ ] Idle timeouts without a thread per connection
 
-**M4: Quality (6/10 done, the six done items are listed above)**
+**M4: Quality (7/11 done, the seven done items are listed above)**
 
 - [ ] Buffer unit tests
 - [ ] GitHub Actions CI (GCC and Clang)
@@ -365,6 +411,9 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end che
   `getHeaderValue` returns only the first match. Enable
   `KeepAliveTest.DISABLED_RepeatedConnectionHeadersAreCombined` when fixed.
 - [ ] Warning flags on the `server` and `common` targets (only tests have them today)
+- [ ] Catch exceptions from route handlers in `Server::clientCallback` and answer 500 (a throwing
+  handler takes the server down today)
+- [ ] Build the mount 405 in one place (both `Router::route` and `StaticFileHandler` do it)
 
 ### Profiling plan
 
@@ -373,7 +422,8 @@ in `docs/PERFORMANCE.md`. Tools: `perf` and flamegraphs, `perf stat`, `strace -c
 `heaptrack`, `wrk` with fixed parameters. Profiling build: `-O2 -g -fno-omit-frame-pointer`.
 
 Questions to settle with data: edge- vs level-triggered epoll, read buffer size,
-copying vs zero-copy parsing, `read`+`write` vs `sendfile()`, per-connection buffer reuse,
+copying vs zero-copy parsing, `read`+`write` vs `sendfile()` (static files are read whole on
+the reactor thread today), per-connection buffer reuse,
 single thread vs worker pool.
 
 ## Contributing workflow
