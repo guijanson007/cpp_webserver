@@ -11,8 +11,8 @@
 #include <server/Server.h>
 #include <sys/epoll.h>
 #include "common/Error.h"
-#include "common/ParseNumber.h"
 #include "http/Router.h"
+#include "http/StaticFileHandler.h"
 #include "server/ServerConfig.h"
 #include "server/ServerConfigParser.h"
 
@@ -70,6 +70,21 @@ Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
     return config;
 }
 
+void registerRoutes(http::Router &router, const ServerConfig &config)
+{
+    router.add(http::HttpMethod::GET, "/", [](const http::Request &)
+               { return http::Response(http::StatusCode::Ok, "Hello, World!", "Content-Type: text/plain", false); });
+
+    router.add(http::HttpMethod::POST, "/echo",
+               [](const http::Request &request)
+               {
+                   return http::Response(http::StatusCode::Ok, std::string(request.body), "Content-Type: text/plain",
+                                         false);
+               });
+
+    router.mount("/static/", http::StaticFileHandler(config.rootDirectory.value(), "/static/"));
+}
+
 int main(int argc, char *argv[])
 {
     /* Optimization: Disable synchronization between C and C++ standard streams for performance. */
@@ -85,16 +100,16 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    if (!configResult.value().rootDirectory)
+    {
+        std::cerr
+                << "Error: Root directory not specified. Use --root <root_directory> to specify the root directory.\n";
+        return EXIT_FAILURE;
+    }
+
     // Configure the router
     http::Router router;
-    router.add(http::HttpMethod::GET, "/", [](const http::Request &)
-               { return http::Response(http::StatusCode::Ok, "Hello, World!", "Content-Type: text/plain", false); });
-    router.add(http::HttpMethod::POST, "/echo",
-               [](const http::Request &request)
-               {
-                   return http::Response(http::StatusCode::Ok, std::string(request.body), "Content-Type: text/plain",
-                                         false);
-               });
+    registerRoutes(router, configResult.value());
 
     Server server(configResult.value(), epollReactor, router);
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <optional>
 #include <string>
 
 struct ServerConfig
@@ -9,5 +10,5 @@ struct ServerConfig
     int port{8080}; // Default port
     int maxConnections{100}; // Default maximum number of connections
     int backlogSize{10'000}; // Default backlog size
-    std::filesystem::path rootDirectory{"."}; // Default root directory
+    std::optional<std::filesystem::path> rootDirectory; // Default root directory
 };

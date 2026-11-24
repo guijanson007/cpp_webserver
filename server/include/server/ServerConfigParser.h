@@ -1,8 +1,12 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 #include <string_view>
+#include <system_error>
+#include "common/Error.h"
 #include "common/ParseNumber.h"
+#include "common/Result.h"
 
 class ServerConfigParser
 {
@@ -34,14 +38,14 @@ public:
         std::error_code ec;
         const auto st = std::filesystem::status(path, ec);
 
+        if (st.type() == std::filesystem::file_type::not_found)
+        {
+            return Error{std::make_error_code(std::errc::no_such_file_or_directory)};
+        }
+
         if (ec)
         {
             return Error{ec};
-        }
-
-        if (!std::filesystem::exists(st))
-        {
-            return Error{std::make_error_code(std::errc::no_such_file_or_directory)};
         }
 
         if (!std::filesystem::is_directory(st))
