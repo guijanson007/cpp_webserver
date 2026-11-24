@@ -31,6 +31,7 @@ skip() { echo "SKIP: $*"; }
 command -v python3 >/dev/null || { echo "FAIL: python3 is required"; exit 1; }
 
 LOG="$(mktemp)"
+WWW_ROOT="$(mktemp -d)" # WEB-11: document root for the /static/ mount
 # Kill the server and, when run under strace, its traced child as well.
 stop_server() {
     pkill -TERM -P "$SERVER_PID" 2>/dev/null
@@ -40,9 +41,9 @@ stop_server() {
     kill -KILL "$SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
 }
-trap 'stop_server; rm -f "$LOG"' EXIT
+trap 'stop_server; rm -f "$LOG"; rm -rf "$WWW_ROOT"' EXIT
 
-"$SERVER_BIN" >"$LOG" 2>&1 &
+"$SERVER_BIN" --root "$WWW_ROOT" >"$LOG" 2>&1 &
 SERVER_PID=$!
 sleep 0.5
 kill -0 "$SERVER_PID" 2>/dev/null || { echo "FAIL: server did not start (port $PORT in use?)"; exit 1; }
@@ -196,7 +197,8 @@ if ! command -v strace >/dev/null; then
 else
     stop_server
     STRACE_LOG="$(mktemp)"
-    strace -f -e trace=epoll_ctl -o "$STRACE_LOG" "$SERVER_BIN" >/dev/null 2>&1 &
+WWW_ROOT="$(mktemp -d)" # WEB-11: document root for the /static/ mount
+    strace -f -e trace=epoll_ctl -o "$STRACE_LOG" "$SERVER_BIN" --root "$WWW_ROOT" >/dev/null 2>&1 &
     SERVER_PID=$!
     sleep 0.7
     # small echo: never needs EPOLLOUT

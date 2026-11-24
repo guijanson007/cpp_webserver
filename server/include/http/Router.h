@@ -37,26 +37,69 @@ namespace http
         void add(HttpMethod method, std::string_view path, H handler)
         {
             // This maps Path -> Array of Methods -> Handler
-            routes[std::string(path)][static_cast<uint8_t>(method)] = std::move(handler);
+            m_routes[std::string(path)][static_cast<uint8_t>(method)] = std::move(handler);
+        }
+
+        template<RequestHandler H>
+        void mount(std::string_view prefix, H handler)
+        {
+            m_mounts.push_back(Mount{std::string(prefix), std::move(handler)});
+            // Longest prefix wins when multiple mounts overlap
+            std::stable_sort(m_mounts.begin(), m_mounts.end(),
+                             [](const Mount &a, const Mount &b) { return a.prefix.size() > b.prefix.size(); });
         }
 
         [[nodiscard]] Response route(const Request &request) const
         {
-            // ignore the query string for routing purposes
-            auto query_pos = request.target.find('?');
-            auto it = routes.find(query_pos == std::string_view::npos ? request.target
-                                                                      : request.target.substr(0, query_pos));
-            if (it == routes.end())
+            const auto query_pos = request.target.find('?');
+            const std::string_view path =
+                    (query_pos == std::string_view::npos) ? request.target : request.target.substr(0, query_pos);
+
+            // 1. Exact routes always win
+            if (auto it = m_routes.find(path); it != m_routes.end())
             {
-                return {StatusCode::NotFound, "", "", !request.shouldKeepAlive()}; // 404 Not Found
+                return dispatchExact(it->second, request);
             }
 
-            const auto &methods = it->second;
+            // 2. Prefix mounts (GET / HEAD)
+            for (const auto &m: m_mounts)
+            {
+                if (matchesPrefix(path, m.prefix))
+                {
+                    if (request.method != HttpMethod::GET && request.method != HttpMethod::HEAD)
+                    {
+                        return {StatusCode::MethodNotAllowed, "", "Allow: GET, HEAD", !request.shouldKeepAlive()};
+                    }
+                    return m.handler(request);
+                }
+            }
+
+            return {StatusCode::NotFound, "", "", !request.shouldKeepAlive()};
+        }
+
+    private:
+        struct Mount
+        {
+            std::string prefix;
+            HandlerFunc handler;
+        };
+
+        [[nodiscard]] static bool matchesPrefix(std::string_view path, std::string_view prefix) noexcept
+        {
+            if (!path.starts_with(prefix))
+                return false;
+            if (prefix.ends_with('/') || path.size() == prefix.size())
+                return true;
+            return path[prefix.size()] == '/';
+        }
+
+        [[nodiscard]] static Response dispatchExact(const std::array<std::optional<HandlerFunc>, MAX_METHODS> &methods,
+                                                    const Request &request)
+        {
             const auto method_idx = static_cast<uint8_t>(request.method);
 
             if (method_idx >= MAX_METHODS || !methods[method_idx])
             {
-                // Allow HEAD requests to be handled by the GET handler if it exists
                 if (request.method == HttpMethod::HEAD && methods[static_cast<uint8_t>(HttpMethod::GET)])
                 {
                     return methods[static_cast<uint8_t>(HttpMethod::GET)].value()(request);
@@ -79,24 +122,19 @@ namespace http
                 if (methods[static_cast<uint8_t>(HttpMethod::POST)])
                 {
                     if (hasPrevious)
-                    {
                         allowHeader += ", ";
-                    }
                     allowHeader += "POST";
                 }
 
-                // RFC requirement: If the target exists but the method is unsupported, return 405
                 return {StatusCode::MethodNotAllowed, "", allowHeader, !request.shouldKeepAlive()};
             }
 
-            // Execute the handler
             return methods[method_idx].value()(request);
         }
 
-    private:
-        // Fast path lookup, array index for method lookup
         std::unordered_map<std::string, std::array<std::optional<HandlerFunc>, MAX_METHODS>, StringViewHash,
                            std::equal_to<>>
-                routes; // Enable heterogeneous lookup with std::string_view
+                m_routes;
+        std::vector<Mount> m_mounts;
     };
 } // namespace http

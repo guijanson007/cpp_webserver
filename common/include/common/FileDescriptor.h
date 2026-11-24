@@ -27,6 +27,10 @@ public:
 
     FileDescriptor(FileDescriptor &&o) noexcept : m_fd(std::exchange(o.m_fd, -1)) {}
 
+    explicit operator bool() const { return m_fd >= 0; }
+
+    [[nodiscard]] bool valid() const { return m_fd >= 0; }
+
     FileDescriptor &operator=(FileDescriptor &&o) noexcept
     {
         if (this != &o)
