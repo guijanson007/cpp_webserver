@@ -107,15 +107,19 @@ server/include/network/Connection.h      client fd + read/write buffers
 server/include/http/Request.h            Request (string_views into the read buffer), SizeLimits, iequals
 server/include/http/Parser.h             http::parse(): stateless request-head parser, ParseError
 server/include/http/Response.h           Response::serialize(), StatusCode, reason phrases
-server/include/http/Router.h             RequestHandler concept, Router (exact path, 404/405, HEAD->GET)
+server/include/http/Router.h             RequestHandler concept, Router (exact path, prefix mounts, 404/405, HEAD->GET)
+server/include/http/StaticFileHandler.h  /static/ handler: decode, refuse `.` segments, read beneath root fd
+server/include/http/MimeTypes.h          extension -> Content-Type
+common/include/common/FileReader.h       openDirectory (O_PATH), readRegularFileBeneath (openat2 RESOLVE_BENEATH)
+server/include/server/ServerConfigParser.h  per-flag validation (port, cap, backlog, --root)
 server/include/server/Server.h           listener, accept loop, client table, clientCallback
 server/src/main.cpp                      wiring only
-tests/                                   GoogleTest (FetchContent): error, result, socketio, parser, response, request (keep-alive), router tests
+tests/                                   GoogleTest (FetchContent): error, result, socketio, parser, response, request (keep-alive), router, mime, file_reader, static_file_handler, server_config_parser tests
 scripts/check_*.sh                       WEB-1..WEB-4 and WEB-7 checks (see Workflow conventions)
 docs/tickets/WEB-<n>.md                  tickets from /next_task
 ```
 
-## Current architecture (after WEB-10)
+## Current architecture (after WEB-11)
 
 - `EpollReactor` is a dumb dispatcher: `add(fd, events, handler)`, `modify`, `remove`,
   `run()` (one `epoll_wait` pass). All four return `Result<void>`. Handlers are
@@ -172,6 +176,13 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
   `unordered_map<string, array<optional<function>, MAX_METHODS>>` with transparent lookup. `Server`
   owns a `Router` passed in by `main` (demo routes `GET /`, `POST /echo`), and `clientCallback` sets
   `resp.close_connection` from `shouldKeepAlive()` after routing. Handlers return owning `Response`s.
+- Static files (WEB-11): `--root` is required (`ServerConfig::rootDirectory` is `std::optional`).
+  `main` mounts `StaticFileHandler` on `/static/` with `Router::mount` (exact routes win, longest
+  prefix wins, GET/HEAD only, else 405). The handler holds the root as a `shared_ptr<const
+  FileDescriptor>` (`O_PATH`), percent-decodes, refuses any segment starting with `.`, `\`, NUL,
+  leading `/`, then `readRegularFileBeneath` calls `syscall(SYS_openat2)` with `RESOLVE_BENEATH |
+  RESOLVE_NO_MAGICLINKS` (escape = `EXDEV`; absolute symlinks are refused) and `fstat` + `S_ISREG`.
+  Every failure is 404. Files are read whole on the reactor thread, no size cap.
 - `Connection` owns its `FileDescriptor` and read buffer. Closing = `reactor.remove(fd)`
   then erase from the map (the destructor closes the fd; never call raw `close` on an
   fd a `Connection` owns).
@@ -181,16 +192,17 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
-  WEB-10 (done: router, 404/405, routing section in `check_http.sh`). Before that WEB-9 (done: strict argument parsing, `check_args.sh`). Before that WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
-  parsing, body section in `check_http.sh`). Next: M3 static files + MIME + traversal protection, then idle timeouts, after, or together with,
-  a small cleanup ticket (`[[nodiscard]] Result`, warning flags).
+  WEB-11 (done: static files, MIME, `openat2` traversal protection, `Router::mount`, required `--root`,
+  `static-*` cases in `check_http.sh`). Before that WEB-10 (done: router, 404/405, routing section in `check_http.sh`). Before that WEB-9 (done: strict argument parsing, `check_args.sh`). Before that WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
+  parsing, body section in `check_http.sh`). Next: M3 idle timeouts, after, or together with, a small cleanup ticket (route() exception guard ->
+  500, `[[nodiscard]] Result`, warning flags).
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
   `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_args.sh` (WEB-9: CLI validation), `check_http.sh` (WEB-7/WEB-8: GET/HEAD,
-  keep-alive, HTTP/1.0, pipelining, error statuses, POST bodies, 413, curl). `check_write_path.sh` and `check_scale.sh`
-  speak HTTP now (backpressure = 100k pipelined requests). All pass on `web-9`.
+  keep-alive, HTTP/1.0, pipelining, error statuses, POST bodies, 413, routing, static files, curl). `check_write_path.sh` and `check_scale.sh`
+  speak HTTP now (backpressure = 100k pipelined requests). All pass on `web-11`. Every script starts the server with a temp `--root` (it is required).
   Scripts count connections with `ss`, not server logs. Pass `--max-connections` explicitly.
-- Unit tests: `ctest --test-dir build --output-on-failure` (142 tests run on `web-9`, 1 of
+- Unit tests: `ctest --test-dir build --output-on-failure` (242 tests on `web-11`, 1 of
   them `DISABLED_`: repeated `Connection` headers). Add a test with every new parser/router/buffer
   unit; `SocketIo` tests use `socketpair`; parser, response and keep-alive tests are socket-free.
 
@@ -215,7 +227,7 @@ cmake --build build
 Needs CMake >= 4.3. Formatting: `.clang-format` in repo root.
 
 ```
-build/server/server --port 8080 --max-connections 1000    # run (always pass the cap)
+build/server/server --port 8080 --max-connections 1000 --root ./www   # run (always pass the cap; --root is required)
 ctest --test-dir build --output-on-failure                # all unit tests
 build/tests/common_tests --gtest_filter='SocketIo*'       # one suite/test (binary: common_tests)
 scripts/check_write_path.sh [server-binary] [port]        # check scripts default to build/server/server, port 8080
@@ -265,7 +277,17 @@ curl POST checks in `check_http.sh`.
 Fixed (WEB-9): strict argument parsing (`common/ParseNumber.h`, ranges, exit 1), `check_args.sh`,
 leftover `asm-generic` include and `HttpMethod::DELETE` removed, +9 tests.
 
+Fixed (WEB-11): static files, MIME, traversal protection via `openat2(RESOLVE_BENEATH)` on a root fd
+(replaced a `canonical()` + prefix check that had a TOCTOU race), `Router::mount`, required `--root`,
+dotfiles refused, `FileDescriptor::operator bool` explicit, `syscall(OPENAT2_REGULAR, ...)` passing a
+flag as the syscall number (was `read`, EBADF), +86 tests.
+
 Open:
+
+- `Server::clientCallback` does not catch exceptions from `Router::route`; a throwing handler
+  terminates the server. Should be a 500.
+- Mount 405 is built in both `Router::route` and `StaticFileHandler`.
+- Static files are read whole on the reactor thread with no size cap (`sendfile` profiling ticket).
 
 - `EMFILE` message prints on every discard (rate-limit or drop).
 - `MAX_EVENTS` is 10'000, a guess. Settle by profiling.
