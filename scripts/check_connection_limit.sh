@@ -16,9 +16,10 @@ pass() { echo "PASS: $*"; }
 [[ -x "$SERVER_BIN" ]] || fail "server binary not found: $SERVER_BIN (build first)"
 command -v ss >/dev/null || fail "'ss' (iproute2) is required"
 
-"$SERVER_BIN" --max-connections "$LIMIT" >/dev/null 2>&1 &
+WWW_ROOT="$(mktemp -d)" # WEB-11: document root for the /static/ mount
+"$SERVER_BIN" --max-connections "$LIMIT" --root "$WWW_ROOT" >/dev/null 2>&1 &
 SERVER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null' EXIT
+trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; rm -rf "$WWW_ROOT"' EXIT
 sleep 0.5
 kill -0 "$SERVER_PID" 2>/dev/null || fail "server did not start (port $PORT in use?)"
 

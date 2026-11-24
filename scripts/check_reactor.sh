@@ -63,7 +63,7 @@ alive() { kill -0 "$SERVER_PID" 2>/dev/null; }
 # ---------------------------------------------------------------- 1. double close
 if ((HAVE_STRACE)); then
   echo "[1/3] strace: looking for double close()"
-  strace -f -o "$STRACE_LOG" -e trace=close,accept4,epoll_ctl "$SERVER_BIN" --max-connections 10 >"$LOG" 2>&1 &
+  strace -f -o "$STRACE_LOG" -e trace=close,accept4,epoll_ctl "$SERVER_BIN" --max-connections 10 --root "$WORKDIR" >"$LOG" 2>&1 &
   WRAPPER_PID=$!
   sleep 1
   # The traced server is the child of strace.
@@ -96,7 +96,7 @@ fi
 
 # ---------------------------------------------------------------- 2. SIGSTOP / SIGCONT
 echo "[2/3] SIGSTOP/SIGCONT"
-"$SERVER_BIN" --max-connections 10 >"$LOG" 2>&1 &
+"$SERVER_BIN" --max-connections 10 --root "$WORKDIR" >"$LOG" 2>&1 &
 SERVER_PID=$!
 sleep 0.5
 alive || fail "server did not start (port $PORT in use?)"

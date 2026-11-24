@@ -8,7 +8,8 @@
 #   3. incomplete unknown flag and a flag with no value exit 1
 #   4. accepted   valid values start the server, which answers curl; the printed port is the bound port
 #   5. root       (WEB-11) --root rejects a missing path, a regular file, an empty value, a dangling
-#                 symlink and a missing value, each with the reason on stderr; a valid directory starts
+#                 symlink and a missing value, each with the reason on stderr; omitting --root exits 1;
+#                 a valid directory starts
 #
 # Usage: scripts/check_args.sh [server-binary] [port]
 # Defaults: build/server/server, 8080
@@ -78,7 +79,7 @@ expect_reject bogus --bogus
 expect_reject port --port
 
 # 4. valid values start the server
-"$SERVER_BIN" --port "$PORT" --max-connections 1000 --backlog 128 >"$LOG" 2>"$ERR" &
+"$SERVER_BIN" --port "$PORT" --max-connections 1000 --backlog 128 --root "$ROOT_TMP" >"$LOG" 2>"$ERR" &
 SERVER_PID=$!
 sleep 0.5
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -107,6 +108,7 @@ expect_reject_reason "not a directory" --port "$PORT" --max-connections 10 --roo
 expect_reject_reason "invalid" --port "$PORT" --max-connections 10 --root ""
 expect_reject_reason "no such file" --port "$PORT" --max-connections 10 --root "$ROOT_TMP/dangling"
 expect_reject root --port "$PORT" --max-connections 10 --root
+expect_reject root --port "$PORT" --max-connections 10   # --root is required
 
 "$SERVER_BIN" --port "$PORT" --max-connections 10 --root "$ROOT_TMP/www" >"$LOG" 2>"$ERR" &
 SERVER_PID=$!

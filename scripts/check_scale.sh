@@ -44,7 +44,7 @@ trap 'stop_all; rm -rf "$TMPDIR_CHECK"' EXIT
 start_server() {
   local nofile="$1"
   shift
-  (ulimit -n "$nofile" && exec "$SERVER_BIN" --port "$PORT" "$@") >/dev/null 2>&1 &
+  (ulimit -n "$nofile" && exec "$SERVER_BIN" --port "$PORT" --root "$TMPDIR_CHECK" "$@") >/dev/null 2>&1 &
   SERVER_PID=$!
   sleep 0.5
   kill -0 "$SERVER_PID" 2>/dev/null ||

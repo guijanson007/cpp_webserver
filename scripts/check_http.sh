@@ -30,6 +30,18 @@
 #  24. route-echo      POST /echo returns the body byte for byte (binary-safe)
 #  25. route-close     404/405 with "Connection: close" carry the header and close
 #  26. route-survival  the server still answers after the routing cases
+# WEB-11 (static files; --root is a temp dir served under /static/, a secret file sits next to it):
+#  27. static-get        GET /static/index.html -> 200, byte-exact body, text/html, keep-alive
+#  28. static-head       HEAD -> same headers as GET, no body, next request still framed
+#  29. static-mime       css, txt, upper-case .PNG, unknown extension -> octet-stream
+#  30. static-binary     a 300 KB binary file (all byte values) arrives byte for byte
+#  31. static-404        missing file, directories, "/static" without slash -> 404, keep-alive preserved
+#  32. static-traversal  "..", ".", encoded "..", absolute path, backslash, NUL, dotfiles, escaping symlinks:
+#                        never 200, never the secret bytes (raw sockets, so no client normalisation)
+#  33. static-405        POST under the mount -> 405 + "Allow: GET, HEAD"
+#  34. static-pipelined  static, dynamic, static in one send -> three responses in order
+#  35. static-close      "Connection: close" on a static file -> header + close
+#  36. static-survival   the server still answers after the static cases
 #
 # Usage: scripts/check_http.sh [server-binary] [port]
 # Defaults: build/server/server, 8080
@@ -46,9 +58,31 @@ pass() { echo "PASS: $*"; }
 command -v python3 >/dev/null || { echo "FAIL: python3 is required"; exit 1; }
 
 LOG="$(mktemp)"
-trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; rm -f "$LOG"' EXIT
+# WEB-11 fixture: $STATIC_DIR/www is the document root, $STATIC_DIR/secret.txt must never be served.
+STATIC_DIR="$(mktemp -d)"
+trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; rm -f "$LOG"; rm -rf "$STATIC_DIR"' EXIT
+WWW="$STATIC_DIR/www"
+mkdir -p "$WWW/sub" "$STATIC_DIR/www-evil"
+printf 'TOP-SECRET-CONTENT\n' >"$STATIC_DIR/secret.txt"
+printf 'TOP-SECRET-CONTENT\n' >"$STATIC_DIR/www-evil/secret.txt"
+printf '<!doctype html><h1>static index</h1>\n' >"$WWW/index.html"
+printf 'body { color: red; }\n' >"$WWW/style.css"
+printf 'nested page\n' >"$WWW/sub/page.txt"
+printf 'png-ish\n' >"$WWW/LOGO.PNG"
+printf 'raw\n' >"$WWW/data.unknownext"
+python3 -I -c 'import sys; open(sys.argv[1], "wb").write(bytes(range(256)) * 1200)' "$WWW/blob.bin"
+ln -s "$STATIC_DIR/secret.txt" "$WWW/leak.txt"
+ln -s "$STATIC_DIR" "$WWW/up"
+ln -s "$STATIC_DIR/www-evil/secret.txt" "$WWW/evil.txt"
+ln -s /etc/passwd "$WWW/passwd"
+ln -s ../secret.txt "$WWW/leak-rel.txt"
+ln -s .. "$WWW/up-rel"
+ln -s index.html "$WWW/alias.html"
+mkdir -p "$WWW/.git"
+printf 'TOP-SECRET-CONTENT\n' >"$WWW/.git/config"
+printf 'TOP-SECRET-CONTENT\n' >"$WWW/.env"
 
-"$SERVER_BIN" --port "$PORT" --max-connections 1000 >"$LOG" 2>&1 &
+"$SERVER_BIN" --port "$PORT" --max-connections 1000 --root "$WWW" >"$LOG" 2>&1 &
 SERVER_PID=$!
 sleep 0.5
 kill -0 "$SERVER_PID" 2>/dev/null || { echo "FAIL: server did not start (port $PORT in use?)"; exit 1; }
@@ -56,10 +90,22 @@ kill -0 "$SERVER_PID" 2>/dev/null || { echo "FAIL: server did not start (port $P
 # One python helper runs every case; each case exits 0 on success. Shared helpers come first.
 run_case() {
     local name="$1" desc="$2"
-    python3 -I - "$PORT" "$name" <<'PY'
-import socket, sys, time
+    python3 -I - "$PORT" "$name" "$STATIC_DIR" <<'PY'
+import os, socket, sys, time
 
-port, case = int(sys.argv[1]), sys.argv[2]
+port, case, static_dir = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+WWW = os.path.join(static_dir, "www")
+SECRET = b"TOP-SECRET"
+
+def file_bytes(rel):
+    with open(os.path.join(WWW, rel), "rb") as f:
+        return f.read()
+
+def req(method, target, extra=b""):
+    if isinstance(target, str):
+        target = target.encode("latin-1")
+    body = b"Content-Length: 0\r\n" if method == b"POST" else b""
+    return method + b" " + target + b" HTTP/1.1\r\nHost: x\r\n" + body + extra + b"\r\n"
 HOST_REQ = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
 
 def conn():
@@ -433,7 +479,110 @@ elif case == "route-close":
         check(h.get("connection", "").lower() == "close", "%d for %r lacks 'Connection: close'" % (st, raw[:20]))
         check(closed_by_server(s), "connection stayed open after %d for %r" % (st, raw[:20]))
 
-elif case == "route-survival":
+elif case == "static-get":
+    s = conn(); s.sendall(req(b"GET", "/static/index.html"))
+    st, h, body, rest, line = read_response(s)
+    check(st == 200, "GET /static/index.html -> %r" % line)
+    check(body == file_bytes("index.html"), "body differs from the file: %r" % body[:80])
+    check(h.get("content-type", "").startswith("text/html"), "Content-Type: %r" % h.get("content-type"))
+    check(h.get("connection", "").lower() != "close", "static 200 closes a keep-alive connection")
+    s.sendall(req(b"GET", "/static/sub/page.txt"))
+    st, h, body, rest, line = read_response(s)
+    check(st == 200 and body == file_bytes("sub/page.txt"), "second request on the connection: %r %r" % (line, body))
+    s.sendall(req(b"GET", "/static/index.html?v=2"))
+    st, h, body, *_ = read_response(s)
+    check(st == 200 and body == file_bytes("index.html"), "query string not ignored: %d" % st)
+    s.sendall(req(b"GET", "/static/alias.html"))
+    st, h, body, *_ = read_response(s)
+    check(st == 200 and body == file_bytes("index.html"), "relative symlink inside the root: %d" % st)
+
+elif case == "static-head":
+    s = conn(); s.sendall(req(b"GET", "/static/style.css") + req(b"HEAD", "/static/style.css"))
+    st, hg, body, rest, _ = read_response(s)
+    st2, hh, body2, rest2, line = read_response(s, rest, head_only=True)
+    check(st2 == 200, "HEAD -> %r" % line)
+    check(hh.get("content-length") == hg.get("content-length") == str(len(file_bytes("style.css"))),
+          "HEAD Content-Length %r, GET %r" % (hh.get("content-length"), hg.get("content-length")))
+    check(hh.get("content-type") == hg.get("content-type"), "HEAD Content-Type differs from GET")
+    check(rest2 == b"", "HEAD sent body bytes: %r" % rest2)
+    s.sendall(HOST_REQ)
+    st3, *_ = read_response(s)
+    check(st3 == 200, "request after HEAD got %d (stray body bytes?)" % st3)
+
+elif case == "static-mime":
+    s = conn()
+    for target, want in (("/static/style.css", "text/css"), ("/static/sub/page.txt", "text/plain"),
+                         ("/static/LOGO.PNG", "image/png"), ("/static/data.unknownext", "application/octet-stream"),
+                         ("/static/blob.bin", "application/octet-stream")):
+        s.sendall(req(b"GET", target))
+        st, h, body, *_ = read_response(s)
+        check(st == 200, "%s -> %d" % (target, st))
+        check(h.get("content-type", "").split(";")[0].strip() == want, "%s Content-Type %r, wanted %s" % (target, h.get("content-type"), want))
+
+elif case == "static-binary":
+    want = file_bytes("blob.bin")
+    s = conn(); s.sendall(req(b"GET", "/static/blob.bin"))
+    st, h, body, *_ = read_response(s)
+    check(st == 200 and int(h.get("content-length", -1)) == len(want), "status %d, Content-Length %r, file %d" % (st, h.get("content-length"), len(want)))
+    check(body == want, "binary body differs (%d bytes back)" % len(body))
+
+elif case == "static-404":
+    s = conn()
+    for target in ("/static/missing.txt", "/static/sub/missing.txt", "/static/", "/static/sub", "/static/sub/",
+                   "/static", "/static/index.html/x"):
+        s.sendall(req(b"GET", target))
+        st, h, body, rest, line = read_response(s)
+        check(st == 404, "%s -> %r, wanted 404" % (target, line))
+        check(h.get("connection", "").lower() != "close", "404 for %s closed a keep-alive connection" % target)
+    check(still_open(s), "connection closed after static 404s")
+
+elif case == "static-traversal":
+    abs_secret = os.path.join(static_dir, "secret.txt")
+    targets = [b"/static/../secret.txt", b"/static/sub/../../secret.txt", b"/static/..",
+               b"/static/../www-evil/secret.txt", b"/static/%2e%2e/secret.txt", b"/static/%2E%2E/secret.txt",
+               b"/static/..%2fsecret.txt", b"/static/%2e%2e%2fsecret.txt", b"/static/.%2e/secret.txt",
+               b"/static/" + abs_secret.encode(), b"/static/%2F" + abs_secret.lstrip("/").encode(),
+               b"/static/..\\secret.txt", b"/static/..%5csecret.txt", b"/static/index.html%00.txt",
+               b"/static/leak.txt", b"/static/up/secret.txt", b"/static/evil.txt", b"/static/passwd",
+               b"/static/leak-rel.txt", b"/static/up-rel/secret.txt", b"/static/up-rel/www/index.html",
+               b"/static/.git/config", b"/static/.env", b"/static/%2egit/config", b"/static/./index.html"]
+    for t in targets:
+        s = conn(); s.sendall(req(b"GET", t))
+        try:
+            st, h, body, rest, line = read_response(s)
+        except (EOFError, ConnectionResetError):
+            continue  # closed without a response: nothing leaked
+        check(st != 200, "%r was served (200)" % t)
+        check(400 <= st < 500, "%r -> %r, wanted a 4xx" % (t, line))
+        check(SECRET not in body and b"root:" not in body, "%r leaked file content" % t)
+    s = conn(); s.sendall(HOST_REQ)
+    st, *_ = read_response(s)
+    check(st == 200, "server unhealthy after traversal attempts: %d" % st)
+
+elif case == "static-405":
+    s = conn(); s.sendall(req(b"POST", "/static/index.html"))
+    st, h, body, rest, line = read_response(s)
+    check(st == 405, "POST /static/index.html -> %r" % line)
+    check(h.get("allow", "").replace(" ", "") == "GET,HEAD", "Allow: %r" % h.get("allow"))
+    check(still_open(s), "405 under the mount closed a keep-alive connection")
+
+elif case == "static-pipelined":
+    s = conn(); s.sendall(req(b"GET", "/static/index.html") + HOST_REQ + req(b"GET", "/static/sub/page.txt"))
+    st1, _, b1, rest, _ = read_response(s)
+    st2, _, b2, rest, _ = read_response(s, rest)
+    st3, _, b3, rest, _ = read_response(s, rest)
+    check((st1, st2, st3) == (200, 200, 200), "statuses %r" % ((st1, st2, st3),))
+    check(b1 == file_bytes("index.html") and b2 == b"Hello, World!" and b3 == file_bytes("sub/page.txt"),
+          "out of order or wrong bodies: %r %r %r" % (b1[:20], b2[:20], b3[:20]))
+
+elif case == "static-close":
+    s = conn(); s.sendall(req(b"GET", "/static/index.html", b"Connection: close\r\n"))
+    st, h, body, *_ = read_response(s)
+    check(st == 200 and body == file_bytes("index.html"), "status %d" % st)
+    check(h.get("connection", "").lower() == "close", "no 'Connection: close' on the static 200")
+    check(closed_by_server(s), "connection stayed open after Connection: close")
+
+elif case == "static-survival" or case == "route-survival":
     s = conn(); s.sendall(HOST_REQ)
     st, *_ = read_response(s)
     check(st == 200, "server no longer answers: %d" % st)
@@ -476,6 +625,18 @@ run_case route-echo      "POST /echo returns the body byte for byte"
 run_case route-close     "404/405 honor Connection: close and HTTP/1.0"
 run_case route-survival  "server still serving after the routing cases"
 
+# WEB-11: static files.
+run_case static-get        "GET /static/index.html -> byte-exact file, text/html, keep-alive"
+run_case static-head       "HEAD on a static file: same headers, no body"
+run_case static-mime       "Content-Type per extension, case-insensitive, octet-stream fallback"
+run_case static-binary     "300 KB binary file arrives byte for byte"
+run_case static-404        "missing files and directories -> 404, keep-alive preserved"
+run_case static-traversal  "traversal and escaping symlinks never serve outside the root"
+run_case static-405        "POST under the mount -> 405 + Allow: GET, HEAD"
+run_case static-pipelined  "static and dynamic responses pipelined in order"
+run_case static-close      "Connection: close honored on a static file"
+run_case static-survival   "server still serving after the static cases"
+
 # Cross-check with curl when available (the ticket's acceptance commands).
 if command -v curl >/dev/null; then
     OUT="$(curl -s -i "http://127.0.0.1:$PORT/")"
@@ -495,6 +656,18 @@ if command -v curl >/dev/null; then
     [[ "$(curl -s "http://127.0.0.1:$PORT/?a=1")" == "Hello, World!" ]] && pass "curl /?a=1 matches /" || fail "curl /?a=1"
     BIG_STATUS="$(head -c 2000000 /dev/zero | curl -s -o /dev/null -w '%{http_code}' --data-binary @- "http://127.0.0.1:$PORT/echo")"
     [[ "$BIG_STATUS" == 413 ]] && pass "curl 2 MB POST -> 413" || fail "curl 2 MB POST -> $BIG_STATUS (wanted 413)"
+    # WEB-11 acceptance commands.
+    STATIC_OUT="$(mktemp)"
+    curl -s -o "$STATIC_OUT" "http://127.0.0.1:$PORT/static/index.html"
+    cmp -s "$STATIC_OUT" "$WWW/index.html" && pass "curl /static/index.html matches the file" || fail "curl /static/index.html differs from the file"
+    rm -f "$STATIC_OUT"
+    curl -s -I "http://127.0.0.1:$PORT/static/style.css" | grep -qi '^Content-Type: text/css' && pass "curl -I style.css -> text/css" || fail "curl -I style.css lacks text/css"
+    [[ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/static/missing.txt")" == 404 ]] && pass "curl missing static -> 404" || fail "curl missing static"
+    TRAV="$(curl -s --path-as-is -w '\n%{http_code}' "http://127.0.0.1:$PORT/static/../secret.txt")"
+    [[ "$TRAV" != *TOP-SECRET* && "${TRAV##*$'\n'}" != 200 ]] && pass "curl --path-as-is traversal blocked" || fail "curl --path-as-is traversal: $TRAV"
+    LEAK="$(curl -s -w '\n%{http_code}' "http://127.0.0.1:$PORT/static/leak.txt")"
+    [[ "$LEAK" != *TOP-SECRET* && "${LEAK##*$'\n'}" == 404 ]] && pass "curl symlink escape -> 404" || fail "curl symlink escape: $LEAK"
+    [[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/static/index.html")" == 405 ]] && pass "curl POST static -> 405" || fail "curl POST static"
 else
     echo "SKIP: curl not installed"
 fi
