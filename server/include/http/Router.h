@@ -4,6 +4,7 @@
 #include <concepts>
 #include <cstdint>
 #include <functional>
+#include <iostream>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -55,26 +56,40 @@ namespace http
             const std::string_view path =
                     (query_pos == std::string_view::npos) ? request.target : request.target.substr(0, query_pos);
 
-            // 1. Exact routes always win
-            if (auto it = m_routes.find(path); it != m_routes.end())
+            try
             {
-                return dispatchExact(it->second, request);
-            }
-
-            // 2. Prefix mounts (GET / HEAD)
-            for (const auto &m: m_mounts)
-            {
-                if (matchesPrefix(path, m.prefix))
+                // 1. Exact routes always win
+                if (auto it = m_routes.find(path); it != m_routes.end())
                 {
-                    if (request.method != HttpMethod::GET && request.method != HttpMethod::HEAD)
-                    {
-                        return {StatusCode::MethodNotAllowed, "", "Allow: GET, HEAD", !request.shouldKeepAlive()};
-                    }
-                    return m.handler(request);
+                    return dispatchExact(it->second, request);
                 }
-            }
 
-            return {StatusCode::NotFound, "", "", !request.shouldKeepAlive()};
+                // 2. Prefix mounts (GET / HEAD)
+                for (const auto &m: m_mounts)
+                {
+                    if (matchesPrefix(path, m.prefix))
+                    {
+                        if (request.method != HttpMethod::GET && request.method != HttpMethod::HEAD)
+                        {
+                            return {StatusCode::MethodNotAllowed, "", "Allow: GET, HEAD", !request.shouldKeepAlive()};
+                        }
+                        return m.handler(request);
+                    }
+                }
+
+                return {StatusCode::NotFound, "", "", !request.shouldKeepAlive()};
+            }
+            // std::bad_alloc and other exceptions can be thrown by std::function, std::string, etc.
+            catch (const std::exception &e)
+            {
+                std::cerr << "Exception during request handling: " << e.what() << std::endl;
+                return {StatusCode::InternalServerError, "", "", true};
+            }
+            catch (...)
+            {
+                std::cerr << "Unknown exception during request handling" << std::endl;
+                return {StatusCode::InternalServerError, "", "", true};
+            }
         }
 
     private:
