@@ -22,6 +22,7 @@ add_executable(common_tests
     parse_number_test.cpp
     router_test.cpp
     server_config_parser_test.cpp
+    server_idle_timeout_test.cpp
     mime_types_test.cpp
     file_reader_test.cpp
     static_file_handler_test.cpp
@@ -30,4 +31,5 @@ add_executable(common_tests
 target_include_directories(common_tests PRIVATE ${PROJECT_SOURCE_DIR}/server/include)
 target_link_libraries(common_tests PRIVATE common GTest::gtest_main)
 target_compile_options(common_tests PRIVATE -Wall -Wextra)
-gtest_discover_tests(common_tests)
+# A hang (e.g. a sweep loop that never advances) must fail, not block ctest forever.
+gtest_discover_tests(common_tests PROPERTIES TIMEOUT 30)

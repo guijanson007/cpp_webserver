@@ -8,19 +8,23 @@
 
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
 #include <common/FileDescriptor.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <format>
+#include <functional>
 #include <iostream>
+#include <list>
 #include <netinet/in.h>
+#include <optional>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <sys/types.h>
-#include <tuple>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
@@ -60,7 +64,6 @@ public:
         {
             return Error::from_errno(errno);
         }
-
         m_socket = FileDescriptor(temp_socket);
 
         std::memset(&s_addr, 0, sizeof(s_addr));
@@ -74,7 +77,6 @@ public:
         }
 
         int opt = 1;
-        // set socket options to allow address reuse
         if (0 > ::setsockopt(m_socket.get(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
         {
             return Error::from_errno(errno);
@@ -90,22 +92,49 @@ public:
             return Error::from_errno(errno);
         }
 
-        // register the server socket with the epoll reactor
-        uint32_t events = EPOLLIN;
-        Result<void> result = m_reactor.add(m_socket.get(), events, [this](int, uint32_t) { this->accept(); });
-        return result;
+        // Create and arm the single periodic timerfd
+        int temp_timer = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        if (temp_timer < 0)
+        {
+            return Error::from_errno(errno);
+        }
+        m_timer_fd = FileDescriptor(temp_timer);
+
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(m_config.sweepInterval);
+        struct itimerspec its{};
+        its.it_value.tv_sec = ns.count() / 1'000'000'000;
+        its.it_value.tv_nsec = ns.count() % 1'000'000'000;
+        its.it_interval = its.it_value;
+
+        if (0 > ::timerfd_settime(m_timer_fd.get(), 0, &its, nullptr))
+        {
+            return Error::from_errno(errno);
+        }
+
+        Result<void> result_timer =
+                m_reactor.add(m_timer_fd.get(), EPOLLIN | EPOLLET,
+                              [this](int fd, uint32_t events_in) { this->timerCallback(fd, events_in); });
+        if (!result_timer)
+        {
+            return result_timer.error();
+        }
+
+        Result<void> result_server = m_reactor.add(m_socket.get(), EPOLLIN, [this](int, uint32_t) { this->accept(); });
+        if (!result_server)
+        {
+            return result_server.error();
+        }
+
+        return {};
     }
 
     void accept()
     {
-        int fd_temp{};
-
         while (true)
         {
-            fd_temp = ::accept4(m_socket.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            int fd_temp = ::accept4(m_socket.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (fd_temp < 0)
             {
-
                 if (errno == EMFILE || errno == ENFILE)
                 {
                     std::cerr << "Process or system FD limit exhausted. Discarding incoming client.\n";
@@ -113,41 +142,55 @@ public:
                     return;
                 }
 
-                if (errno == EAGAIN)
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
                 {
                     return; // no more connections to accept
                 }
 
                 if (errno != EINTR)
                 {
-                    std::cerr << std::format("Failed to accept connection: {}", std::strerror(errno)) << std::endl;
+                    std::cerr << std::format("Failed to accept connection: {}\n", std::strerror(errno));
                     return;
                 }
-                else
-                {
-                    // retry if interrupted by signal
-                    continue;
-                }
+                continue;
             }
-            else // successfully accepted a new connection
+
+            if (static_cast<int>(m_clients.size()) >= m_config.maxConnections)
             {
-                network::Connection new_client(fd_temp);
-
-                if (static_cast<int>(m_clients.size()) >= m_config.maxConnections)
-                {
-                    std::cerr << "Max connections reached. Closing the new connection." << std::endl;
-                    new_client.close();
-                    continue; // keep draining the accept queue
-                }
-
-                uint32_t events = EPOLLIN | EPOLLET; // edge-triggered read events
-                if (!m_reactor.add(fd_temp, events,
-                                   [this, events](int fd, uint32_t events_in) { this->clientCallback(fd, events_in); }))
-                {
-                    return; // let the client socket be closed by the destructor of new_client
-                }
-                m_clients.insert({fd_temp, std::move(new_client)});
+                std::cerr << "Max connections reached. Closing the new connection.\n";
+                ::close(fd_temp);
+                continue; // keep draining the accept queue
             }
+
+            // if the user did not set an idle timeout, the expiresAt will be std::nullopt and the client will never be
+            // closed
+            std::optional<std::chrono::steady_clock::time_point> timeout;
+            if (m_config.idleTimeout.count() != 0)
+            {
+                timeout = std::chrono::steady_clock::now() + m_config.idleTimeout;
+            }
+            else
+            {
+                timeout = std::nullopt;
+            }
+
+            m_timers.emplace_back(fd_temp, timeout);
+
+            auto timer_it = std::prev(m_timers.end());
+
+            network::Connection new_client(fd_temp, timer_it);
+
+            constexpr uint32_t events = EPOLLIN | EPOLLET;
+            Result<void> client_result = m_reactor.add(fd_temp, events, [this](int fd, uint32_t events_in)
+                                                       { this->clientCallback(fd, events_in); });
+
+            if (!client_result)
+            {
+                m_timers.erase(timer_it);
+                return; // new_client destructor closes fd_temp
+            }
+
+            m_clients.emplace(fd_temp, std::move(new_client));
         }
     }
 
@@ -222,9 +265,16 @@ public:
 
     void closeClientConnection(int fd)
     {
-        std::ignore = m_reactor.remove(
-                fd); // ignore the nodiscard warning, we want to remove the fd from epoll regardless of the result
-        m_clients.erase(fd);
+        auto it = m_clients.find(fd);
+
+        if (it == m_clients.end())
+        {
+            return;
+        }
+
+        static_cast<void>(m_reactor.remove(fd));
+        m_timers.erase(it->second.getTimerIterator()); // O(1) removal via stored list iterator
+        m_clients.erase(it);
     }
 
     [[nodiscard]] std::string_view getIp() const { return m_config.ip; }
@@ -236,18 +286,14 @@ public:
 private:
     void discardExcessConnection()
     {
-        // Release the reserved slot
         m_spare_fd = FileDescriptor();
 
-        // Accept into the opened slot
         int discarded_fd = ::accept4(m_socket.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (discarded_fd >= 0)
         {
-            // Close immediately to emit a FIN/RST to the peer and vacate the listen queue
             ::close(discarded_fd);
         }
 
-        // Re-reserve the slot for subsequent bursts
         int new_spare = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (new_spare >= 0)
         {
@@ -255,7 +301,45 @@ private:
         }
         else
         {
-            std::cerr << "Failed to reallocate reserve file descriptor" << std::endl;
+            std::cerr << "Failed to reallocate reserve file descriptor\n";
+        }
+    }
+
+    void timerCallback(int timer_fd, uint32_t events)
+    {
+        if (m_config.idleTimeout.count() == 0)
+        {
+            return; // No idle timeout set, no need to check for expired clients
+        }
+
+        static_cast<void>(events);
+
+        // Mandatory drain for edge-triggered (EPOLLET) timerfd
+        uint64_t expirations{};
+        while (true)
+        {
+            ssize_t n = ::read(timer_fd, &expirations, sizeof(expirations));
+            if (n < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                {
+                    break;
+                }
+                std::cerr << std::format("timerfd read error: {}\n", std::strerror(errno));
+                return;
+            }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+
+        // m_timers is ordered oldest-activity-first via splice(); stop at first active client
+        while (!m_timers.empty() && m_timers.front().expiresAt <= now)
+        {
+            closeClientConnection(m_timers.front().clientFd);
         }
     }
 
@@ -264,29 +348,31 @@ private:
         using namespace network;
 
         auto client_it = m_clients.find(client_fd);
-
         if (client_it == m_clients.end())
         {
             return;
         }
         auto &client = client_it->second;
 
-        // Fatal hardware/epoll error: tear down immediately
         if (events & EPOLLERR)
         {
             closeClientConnection(client_fd);
             return;
         }
 
+        // O(1) timeout refresh: update deadline in userspace and relink to tail of LRU list
+        auto timer_it = client.getTimerIterator();
+        timer_it->expiresAt = std::chrono::steady_clock::now() + m_config.idleTimeout;
+        m_timers.splice(m_timers.end(), m_timers, timer_it);
+
         // Drain pending write buffer on EPOLLOUT
         if ((events & EPOLLOUT) && client.isWaitingForWrite())
         {
             if (auto result = flush(client); !result)
             {
-                return; // flush handles closeClientConnection on error/completion
+                return;
             }
 
-            // Re-check existence in case flush() drained and closed a half-closed client
             if (!m_clients.contains(client_fd))
             {
                 return;
@@ -301,7 +387,6 @@ private:
 
             if (!result)
             {
-                // Real kernel I/O error
                 closeClientConnection(client_fd);
                 return;
             }
@@ -313,16 +398,14 @@ private:
 
                 if (std::holds_alternative<http::NeedMore>(parseOutcome))
                 {
-                    break; // wait for more data to arrive before processing frames
+                    break;
                 }
                 else if (std::holds_alternative<http::Done>(parseOutcome))
                 {
                     const auto &done = std::get<http::Done>(parseOutcome);
                     const auto &req = done.request;
 
-
                     http::Response resp(m_router.route(req));
-
                     resp.close_connection = !req.shouldKeepAlive() || resp.close_connection;
 
                     std::string serialized_resp = resp.serialize();
@@ -360,11 +443,12 @@ private:
 private:
     ServerConfig m_config;
     FileDescriptor m_socket;
-    FileDescriptor m_spare_fd; // spare file descriptor to handle EMFILE/ENFILE errors
+    FileDescriptor m_spare_fd;
+    FileDescriptor m_timer_fd;
+    std::list<network::TimerEntry> m_timers;
     std::unordered_map<int, network::Connection> m_clients;
     network::EpollReactor &m_reactor;
     http::Router m_router;
 };
-
 
 #endif // SERVER_SERVER_H

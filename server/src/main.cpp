@@ -58,12 +58,20 @@ Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
             }
             config.rootDirectory = std::move(rootDirectory.value());
         }
+        else if (arg == "--idle-timeout" && i + 1 < argc)
+        {
+            auto idleTimeout = ServerConfigParser::parseIdleTimeout(argv[++i]);
+            if (!idleTimeout)
+                return std::format("Invalid idle timeout: {}", idleTimeout.error());
+
+            config.idleTimeout = idleTimeout.value();
+        }
         else
         {
             std::string errorMsg = std::format("Unknown or incomplete argument: {}", arg);
             errorMsg += "\nUsage: " + std::string(argv[0]) +
                         " [--port <port>] [--max-connections <max_connections>] [--backlog <backlog_size>] [--root "
-                        "<root_directory>]";
+                        "<root_directory>] [--idle-timeout <seconds>]";
             return errorMsg;
         }
     }

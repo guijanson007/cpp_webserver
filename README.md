@@ -10,7 +10,8 @@ tested and benchmarked server where every design decision is backed by profiling
 > them through a small router (exact paths, prefix mounts, 404, 405 with `Allow`), serves
 > static files from `--root` under `/static/` with MIME types and kernel-enforced traversal
 > protection, and supports keep-alive, pipelining and `HEAD`. A handler that throws gets a
-> 500 instead of taking the server down. Idle timeouts are next.
+> 500 instead of taking the server down. Idle keep-alive connections are closed after
+> `--idle-timeout` seconds (WEB-13), which completes M3. Quality work (CI, sanitizers) is next.
 > See [Progress](#progress).
 
 ## Platform and design decisions
@@ -44,7 +45,8 @@ tested and benchmarked server where every design decision is backed by profiling
                  +---------------v---------------+
                  |  Server                       |  accept loop, connection table,
                  |  unordered_map<fd, Connection>|  connection cap, EMFILE handling,
-                 |                               |  parse -> route -> respond per wakeup
+                 |  list<TimerEntry> (LRU)       |  parse -> route -> respond per wakeup,
+                 |  periodic timerfd             |  idle sweep
                  +-------+---------------+-------+
                          |               |
          +---------------v-----+   +-----v---------------------------+
@@ -71,7 +73,7 @@ tested and benchmarked server where every design decision is backed by profiling
 | `Result<T, E>` | `common/include/common/` | Success-or-error type (C++20 stand-in for `std::expected`). Also `Result<void>`. |
 | `EpollReactor` | `server/include/network/` | Dumb dispatcher. `run()` does one `epoll_wait` pass and calls the registered handler. A handler may remove itself safely. |
 | `SocketIo` | `server/include/network/` | Non-blocking read and write wrappers. EOF and `EAGAIN` are success values, not errors. |
-| `Connection` | `server/include/network/` | Client fd plus read and write buffers. Closing a connection closes its fd through the destructor. |
+| `Connection` | `server/include/network/` | Client fd plus read and write buffers, and an iterator to its `TimerEntry` in the server's idle list. Closing a connection closes its fd through the destructor. |
 | `http::parse` | `server/include/http/Parser.h` | Stateless, incremental request parser (head and `Content-Length` body). Returns a `std::variant<Done, NeedMore, ParseError>`. `Done` holds a `Request` plus `consumed_bytes`. |
 | `Request` | `server/include/http/Request.h` | `string_view`s into the read buffer (method, target, version, raw headers, body) with a case-insensitive `getHeaderValue()` and `shouldKeepAlive()`. Also `SizeLimits`. |
 | `Response` | `server/include/http/Response.h` | Status, body and extra headers. `serialize()` always emits `Content-Length`, plus `Connection: close` when asked. `StatusCode` and `statusCodeToReasonPhrase()` live here. |
@@ -79,8 +81,8 @@ tested and benchmarked server where every design decision is backed by profiling
 | `StaticFileHandler` | `server/include/http/StaticFileHandler.h` | Serves files under a mount prefix from a root directory fd. Percent-decodes, refuses `.` segments (including `..` and dotfiles), backslash and NUL, then reads through `FileReader`. 404 for anything missing, refused or not a regular file. |
 | `FileReader` | `common/include/common/FileReader.h` | File wrapper layer. `openDirectory()` (`O_PATH`) and `readRegularFileBeneath(dirfd, rel)` (`openat2` with `RESOLVE_BENEATH`, `fstat` + `S_ISREG`). |
 | `MimeTypes` | `server/include/http/MimeTypes.h` | Extension to `Content-Type`, case-insensitive, `application/octet-stream` fallback. |
-| `Server` | `server/include/server/` | Listener, accept loop, connection table, cap enforcement, `EMFILE` handling, and the per-connection parse and respond loop. |
-| `ServerConfig` | `server/include/server/` | `ip`, `port`, `maxConnections`, `backlogSize`, `rootDirectory` (optional, required by `main`). `ServerConfigParser` validates each flag. |
+| `Server` | `server/include/server/` | Listener, accept loop, connection table, cap enforcement, `EMFILE` handling, the per-connection parse and respond loop, and the idle sweep (periodic `timerfd` plus an LRU list of deadlines). |
+| `ServerConfig` | `server/include/server/` | `ip`, `port`, `maxConnections`, `backlogSize`, `rootDirectory` (optional, required by `main`), `idleTimeout` (seconds, 0 disables), `sweepInterval`. `ServerConfigParser` validates each flag. |
 
 ### Behaviour worth knowing
 
@@ -95,6 +97,13 @@ tested and benchmarked server where every design decision is backed by profiling
   releases the spare, accepts and closes one connection, then reopens the spare, so the
   level-triggered listener does not spin.
 - **Backlog.** Set separately with `--backlog`. The kernel caps it at `net.core.somaxconn`.
+- **Idle timeouts (WEB-13).** Each connection has a deadline, `now + --idle-timeout`, pushed back on
+  every event it receives. Deadlines live in a `std::list` kept in last-activity order: a refresh
+  `splice`s the entry to the back (O(1), via the iterator stored in `Connection`). One periodic
+  `timerfd` (`EPOLLET`, drained on every tick) runs a sweep every `sweepInterval` (1 s) that closes
+  expired connections from the front and stops at the first live one. A connection closes between
+  `T` and `T + 1 s` after its last activity. `--idle-timeout 0` disables it. A client that trickles
+  bytes keeps resetting its deadline (no request-head deadline yet).
 
 ### Request handling (WEB-7)
 
@@ -232,6 +241,7 @@ build/server/server --port 8080 --max-connections 1000 --backlog 10000 --root ./
 | `--max-connections` | Concurrent connection cap. Pass it explicitly (>= 1). The built-in default is 100. |
 | `--backlog` (or `--backlog-size`) | `listen()` backlog (>= 1). Default 10000. |
 | `--root` | Document root served under `/static/`. Required; must be an existing directory. |
+| `--idle-timeout` | Seconds a connection may stay idle before the server closes it (0-3600, `0` disables). Default 60. |
 
 ```sh
 curl -v http://localhost:8080/        # 200 OK, "Hello, World!"
@@ -252,8 +262,8 @@ Routes: `GET /`, `POST /echo` (demo) and `/static/...` (files from `--root`).
 
 ## Test
 
-Unit tests use GoogleTest and live in a single target, `common_tests` (248 tests, 1 of them a
-disabled known-gap test):
+Unit tests use GoogleTest and live in a single target, `common_tests` (259 tests, 1 of them a
+disabled known-gap test). Each test has a 30 s `ctest` timeout so a hang fails:
 
 ```sh
 ctest --test-dir build --output-on-failure          # everything
@@ -263,12 +273,14 @@ build/tests/common_tests --gtest_filter='Response*:ReasonPhrase*:KeepAlive*'   #
 build/tests/common_tests --gtest_filter='RouterTest*'   # WEB-10 tests
 build/tests/common_tests --gtest_filter='RouterTest.*Throw*:RouterTest.*Exception*'   # WEB-12 tests
 build/tests/common_tests --gtest_filter='Mime*:FileReader*:StaticFileHandler*:RouterMount*:ParseRootDirectory*'   # WEB-11 tests
+build/tests/common_tests --gtest_filter='ParseIdleTimeout*:ServerIdleTimeout*'   # WEB-13 tests (~13 s)
 ```
 
 Add new test files to the `common_tests` source list in `tests/CMakeLists.txt`.
 `SocketIo` tests use `socketpair`, and the parser, response and keep-alive tests are pure
 functions over strings, so none of them need the network. The file and static-handler tests
-build a fresh temp directory per test.
+build a fresh temp directory per test. `ServerIdleTimeoutTest` runs a real `Server` and
+`EpollReactor` in-process on a loopback port and drives `run()` itself.
 
 ### End-to-end check scripts
 
@@ -282,7 +294,8 @@ These start the server themselves. Each takes `[server-binary] [port]` and defau
 | `scripts/check_write_path.sh` | Pipelined responses, RST survival, backpressure (100k pipelined requests, ~8 MB out), half-close flush, `EPOLLOUT` armed only when needed. |
 | `scripts/check_scale.sh` | The cap, 10k idle connections, fd exhaustion. |
 | `scripts/check_http.sh` | GET, HEAD, keep-alive, HTTP/1.0, `Connection: close`, pipelining, byte-by-byte requests, 400/414/431/501/505 followed by close, POST bodies (framing, pipelining, split, 1 MiB limit, 413 before the body, bad lengths, `Transfer-Encoding`), `curl` GET and POST, routing (404, 405 + `Allow`, HEAD fallback, `/echo`, query string, `Connection: close` on errors), and static files (byte-exact bodies, MIME types, HEAD, 404s, 29 traversal and symlink-escape targets over raw sockets, 405, pipelining). |
-| `scripts/check_args.sh` | Command-line validation: bad `--port`, `--max-connections`, `--backlog` and `--root` values exit 1 with the reason; valid values start the server. |
+| `scripts/check_args.sh` | Command-line validation: bad `--port`, `--max-connections`, `--backlog`, `--root` and `--idle-timeout` values exit 1 with the reason; valid values start the server. |
+| `scripts/check_idle_timeout.sh` | Idle timeouts with `--idle-timeout 2`: silent and post-request connections closed in time, active clients kept, active-then-idle closed after the last request, fd reuse after a peer close, 300 idle connections reaped, `--idle-timeout 0` disables. |
 
 The scripts count connections with `ss`, not server logs. All of them start the server with a
 temporary `--root`.
@@ -302,13 +315,13 @@ Planned: `docs/PERFORMANCE.md`.
 
 ## Progress
 
-### Estimated completion: 75%
+### Estimated completion: 81%
 
 ```
-[###############.....]  75%   (33 of 44 required items)
+[################....]  81%   (38 of 47 required items)
 ```
 
-How it is computed: the checklist below has 44 required items across milestones M1-M5.
+How it is computed: the checklist below has 47 required items across milestones M1-M5.
 Each counts equally. M6 is optional and excluded. This is a rough measure of item count,
 not effort. The HTTP parser and the benchmarking work are likely heavier than the
 average done item, so real progress is probably a bit lower.
@@ -362,6 +375,13 @@ average done item, so real progress is probably a bit lower.
 - [x] Required `--root` flag, validated with the OS reason in the error (`ServerConfigParser`)
 - [x] Static-file end-to-end checks in `check_http.sh` (10 cases, 29 traversal targets, curl checks) and `--root` cases in `check_args.sh`
 
+**M3 (done, 13/13): keep-alive and idle timeouts (WEB-13)**
+
+- [x] Keep-alive state machine (persistent connections are reused and closed once idle)
+- [x] Idle timeouts without a thread per connection (one periodic `timerfd`, LRU deadline list, O(1) refresh)
+- [x] `--idle-timeout` flag (0-3600 s, `0` disables, default 60) with `ServerConfigParser::parseIdleTimeout`
+- [x] Idle-timeout end-to-end checks: `check_idle_timeout.sh` (11 checks) and `--idle-timeout` cases in `check_args.sh`
+
 **M4 (partial): Quality foundations**
 
 - [x] Router unit tests (`RouterTest`, 13 tests plus concept `static_assert`s) (WEB-10)
@@ -375,20 +395,17 @@ average done item, so real progress is probably a bit lower.
 - [x] Handler-exception unit tests (`RouterTest`, 6 tests: `std::exception`, `throw 42`, mount, HEAD
   fallback, close, still serving) (WEB-12)
 - [x] Warning flags (`-Wall -Wextra -Wpedantic`) on every target, zero warnings on a clean build (WEB-12)
+- [x] Idle-timeout unit tests: `ParseIdleTimeoutTest` (5) and `ServerIdleTimeoutTest` (6, in-process
+  server on loopback) (WEB-13)
 
 Also done and not counted separately: `Result<T, Error>` error handling with concept
-constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end check scripts
-(the older ones ported to HTTP, plus `check_args.sh`), 431/414 size limits in the parser, HTTP/1.0 and
+constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, seven end-to-end check scripts
+(the older ones ported to HTTP, plus `check_args.sh` and `check_idle_timeout.sh`), 431/414 size limits in the parser, HTTP/1.0 and
 `Connection` token-list handling.
 
 ### Planned
 
-**M3: Routing and static files (9/11, done items listed above)**
-
-- [ ] Keep-alive state machine (keep-alive decision and reuse work; idle timeouts do not)
-- [ ] Idle timeouts without a thread per connection
-
-**M4: Quality (9/13 done, the nine done items are listed above)**
+**M4: Quality (10/14 done, the ten done items are listed above)**
 
 - [ ] Buffer unit tests
 - [ ] GitHub Actions CI (GCC and Clang)
@@ -425,6 +442,9 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end che
 - [x] Warning flags on every target (WEB-12)
 - [x] Catch exceptions from route handlers and answer 500 (WEB-12, in `Router::route`)
 - [ ] Build the mount 405 in one place (both `Router::route` and `StaticFileHandler` do it)
+- [ ] Idle sweep: pop a timer entry whose connection is missing instead of looping forever (WEB-13)
+- [ ] Move the `timerfd` calls in `Server` behind a `TimerFd` wrapper (WEB-13)
+- [ ] Request-head deadline against slowloris (a trickling client keeps resetting its idle timer)
 
 ### Profiling plan
 

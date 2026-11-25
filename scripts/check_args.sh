@@ -10,6 +10,8 @@
 #   5. root       (WEB-11) --root rejects a missing path, a regular file, an empty value, a dangling
 #                 symlink and a missing value, each with the reason on stderr; omitting --root exits 1;
 #                 a valid directory starts
+#   6. idle       (WEB-13) --idle-timeout rejects -1, 3601, abc, 5s, empty, overflow and a missing value;
+#                 0, 1 and 3600 start the server
 #
 # Usage: scripts/check_args.sh [server-binary] [port]
 # Defaults: build/server/server, 8080
@@ -115,6 +117,21 @@ SERVER_PID=$!
 sleep 0.5
 if kill -0 "$SERVER_PID" 2>/dev/null; then pass "root: valid directory starts the server"
 else fail "root: server did not start with --root $ROOT_TMP/www: $(head -c 160 "$ERR")"; fi
+
+# 6. --idle-timeout (WEB-13)
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+for v in -1 3601 abc 5s "" 99999999999999999999; do
+    expect_reject idle --port "$PORT" --max-connections 10 --root "$ROOT_TMP/www" --idle-timeout "$v"
+done
+expect_reject idle --port "$PORT" --max-connections 10 --root "$ROOT_TMP/www" --idle-timeout
+for v in 0 1 3600; do
+    "$SERVER_BIN" --port "$PORT" --max-connections 10 --root "$ROOT_TMP/www" --idle-timeout "$v" >"$LOG" 2>"$ERR" &
+    SERVER_PID=$!
+    sleep 0.5
+    if kill -0 "$SERVER_PID" 2>/dev/null; then pass "idle: --idle-timeout $v starts the server"
+    else fail "idle: --idle-timeout $v did not start: $(head -c 160 "$ERR")"; fi
+    kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+done
 
 echo
 if [[ $FAILS -eq 0 ]]; then echo "ALL CHECKS PASSED"; else echo "$FAILS CHECK(S) FAILED"; exit 1; fi

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 #include <unordered_map>
 #include "common/FileDescriptor.h"
@@ -22,9 +23,9 @@ namespace network
         {
             m_epollFd = FileDescriptor(::epoll_create1(EPOLL_CLOEXEC));
 
-            if (m_epollFd.get() == -1)
+            if (!m_epollFd)
             {
-                throw std::runtime_error("Failed to create epoll instance");
+                throw std::runtime_error("Failed to initialize EpollReactor: " + std::string(strerror(errno)));
             }
         }
 

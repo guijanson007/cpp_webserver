@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -56,7 +57,21 @@ public:
         return path;
     }
 
+    static Result<std::chrono::seconds, std::string> parseIdleTimeout(std::string_view idleTimeoutStr)
+    {
+        auto result = parseInteger<int>(idleTimeoutStr, MIN_IDLE_TIMEOUT.count(), MAX_IDLE_TIMEOUT.count());
+
+        if (!result)
+        {
+            return result.error();
+        }
+
+        return std::chrono::seconds(result.value());
+    }
+
 private:
+    static constexpr std::chrono::duration MIN_IDLE_TIMEOUT = std::chrono::seconds{0}; // 0 seconds means no timeout
+    static constexpr std::chrono::duration MAX_IDLE_TIMEOUT = std::chrono::seconds{3600}; // 1 hour
     static constexpr int MAX_PORT = 65535;
     static constexpr int MIN_PORT = 1;
     static constexpr int MIN_CONNECTIONS = 1;
