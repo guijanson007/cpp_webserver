@@ -114,12 +114,12 @@ common/include/common/FileReader.h       openDirectory (O_PATH), readRegularFile
 server/include/server/ServerConfigParser.h  per-flag validation (port, cap, backlog, --root)
 server/include/server/Server.h           listener, accept loop, client table, clientCallback
 server/src/main.cpp                      wiring only
-tests/                                   GoogleTest (FetchContent): error, result, socketio, parser, response, request (keep-alive), router, mime, file_reader, static_file_handler, server_config_parser tests
+tests/                                   GoogleTest (FetchContent): error, result, socketio, parser, response, request (keep-alive), router, mime, file_reader, static_file_handler, server_config_parser, server_idle_timeout tests
 scripts/check_*.sh                       WEB-1..WEB-4 and WEB-7 checks (see Workflow conventions)
 docs/tickets/WEB-<n>.md                  tickets from /next_task
 ```
 
-## Current architecture (after WEB-11)
+## Current architecture (after WEB-13)
 
 - `EpollReactor` is a dumb dispatcher: `add(fd, events, handler)`, `modify`, `remove`,
   `run()` (one `epoll_wait` pass). All four return `Result<void>`. Handlers are
@@ -140,8 +140,18 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
   `EMFILE`/`ENFILE` it uses a spare `/dev/null` fd: release it, accept and close one
   connection, reopen the spare, so the level-triggered listener does not spin.
 - `ServerConfig` (`server/ServerConfig.h`) holds `ip`, `port`, `maxConnections` (default
-  100) and `backlogSize` (default 10'000). `main` parses `--port`, `--max-connections`,
-  `--backlog` into it. The kernel caps the backlog at `net.core.somaxconn`.
+  100), `backlogSize` (default 10'000), `rootDirectory`, `idleTimeout` (`std::chrono::seconds`,
+  default 60, 0 disables) and `sweepInterval` (`milliseconds`, default 1 s, no flag). `main` parses
+  `--port`, `--max-connections`, `--backlog`, `--root`, `--idle-timeout` into it. The kernel caps
+  the backlog at `net.core.somaxconn`.
+- Idle timeouts (WEB-13): `network::TimerEntry{clientFd, optional<time_point> expiresAt}` (in
+  `Connection.h`) in `Server::m_timers`, a `std::list` in last-activity order. `Connection` stores its
+  list iterator: `clientCallback` refreshes `expiresAt` and `splice`s to the back on every event (after
+  the `EPOLLERR` check); `closeClientConnection` erases it (so every close path removes the timer).
+  `Server::start()` arms one periodic `timerfd` (`EPOLLET`) every `sweepInterval`; `timerCallback`
+  drains it until `EAGAIN`, then closes expired entries from the front and stops at the first live
+  one. Timeout 0: `expiresAt` is `nullopt` and the sweep returns early. The `timerfd_*` calls are raw
+  in `Server` (known issue).
 - HTTP parser (`http/Parser.h`, wired into `Server` since WEB-7, bodies since WEB-8): `http::parse(std::string_view
   buffer, const SizeLimits &) -> ParseOutcome = std::variant<Done, NeedMore, ParseError>` (a plain
   variant, not a `Result`: protocol errors are expected outcomes). Stateless: on
@@ -184,7 +194,7 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
   leading `/`, then `readRegularFileBeneath` calls `syscall(SYS_openat2)` with `RESOLVE_BENEATH |
   RESOLVE_NO_MAGICLINKS` (escape = `EXDEV`; absolute symlinks are refused) and `fstat` + `S_ISREG`.
   Every failure is 404. Files are read whole on the reactor thread, no size cap.
-- `Connection` owns its `FileDescriptor` and read buffer. Closing = `reactor.remove(fd)`
+- `Connection` owns its `FileDescriptor`, read/write buffers and its timer-list iterator. Closing = `reactor.remove(fd)`
   then erase from the map (the destructor closes the fd; never call raw `close` on an
   fd a `Connection` owns).
 - `main` constructs reactor then server, `server.start()`, `while (reactor.run())`.
@@ -193,18 +203,22 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
-  WEB-12 (done: handler exceptions -> 500 + close in `Router::route`, close flags combined in `Server`,
+  WEB-13 (done: idle timeouts with one periodic `timerfd` + LRU list, `--idle-timeout`,
+  `check_idle_timeout.sh`, in-process `ServerIdleTimeoutTest`, ctest `TIMEOUT 30`; M3 complete).
+  Before that WEB-12 (done: handler exceptions -> 500 + close in `Router::route`, close flags combined in `Server`,
   `class [[nodiscard]] Result`, `-Wall -Wextra -Wpedantic` on every target). Before that WEB-11 (done: static files, MIME, `openat2` traversal protection, `Router::mount`, required `--root`,
   `static-*` cases in `check_http.sh`). Before that WEB-10 (done: router, 404/405, routing section in `check_http.sh`). Before that WEB-9 (done: strict argument parsing, `check_args.sh`). Before that WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
-  parsing, body section in `check_http.sh`). Next: M3 idle timeouts.
+  parsing, body section in `check_http.sh`). Next: M4 quality (CI, sanitizers, clang-tidy) or the
+  WEB-13 follow-ups in Known issues.
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
-  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_args.sh` (WEB-9: CLI validation), `check_http.sh` (WEB-7/WEB-8: GET/HEAD,
+  `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_args.sh` (WEB-9: CLI validation), `check_idle_timeout.sh` (WEB-13: idle close, activity
+  refresh, fd reuse, 300 idle, `--idle-timeout 0`), `check_http.sh` (WEB-7/WEB-8: GET/HEAD,
   keep-alive, HTTP/1.0, pipelining, error statuses, POST bodies, 413, routing, static files, curl). `check_write_path.sh` and `check_scale.sh`
-  speak HTTP now (backpressure = 100k pipelined requests). All pass on `web-12`. Every script starts the server with a temp `--root` (it is required).
+  speak HTTP now (backpressure = 100k pipelined requests). All pass on `web-13`. Every script starts the server with a temp `--root` (it is required).
   Scripts count connections with `ss`, not server logs. Pass `--max-connections` explicitly.
-- Unit tests: `ctest --test-dir build --output-on-failure` (248 tests on `web-12`, 1 of
-  them `DISABLED_`: repeated `Connection` headers). Add a test with every new parser/router/buffer
+- Unit tests: `ctest --test-dir build --output-on-failure` (259 tests on `web-13`, 1 of
+  them `DISABLED_`: repeated `Connection` headers; 30 s timeout per test). Add a test with every new parser/router/buffer
   unit; `SocketIo` tests use `socketpair`; parser, response and keep-alive tests are socket-free.
 
 ## Webserver ticket workflow (WEB-N)
@@ -289,12 +303,27 @@ intermediate version trusted only the handler flag and broke `Connection: close`
 `check_http.sh`); `class [[nodiscard]] Result`; `add_compile_options(-Wall -Wextra -Wpedantic)` at top
 level (also reaches GoogleTest); client warnings fixed; +6 `RouterTest` tests.
 
+Fixed (WEB-13): idle timeouts (see Current architecture); `std::ignore` discard in
+`closeClientConnection` replaced by `static_cast<void>`; ASan stack-use-after-scope in 5
+`ParserBodyTest` tests (pointer into a temporary `Outcome`); +11 tests, `check_idle_timeout.sh`.
+
 Open:
 
-- `closeClientConnection` discards with `std::ignore = ...` (only specified for `std::tie` before
-  C++26); the rest of the code uses `static_cast<void>(...)`.
 - Mount 405 is built in both `Router::route` and `StaticFileHandler`.
 - Static files are read whole on the reactor thread with no size cap (`sendfile` profiling ticket).
+- (WEB-13) `Server::timerCallback` sweep loop `while (front().expiresAt <= now)
+  closeClientConnection(front().clientFd)` only advances if that fd is in `m_clients`. If `m_timers`
+  and `m_clients` ever disagree, the reactor spins forever (seen by removing the `m_timers.erase` in
+  `closeClientConnection`: `PeerCloseLeavesNoStaleTimerForReusedFd` hangs). Pop the front entry
+  itself when the client is missing.
+- (WEB-13) `timerfd_create`, `timerfd_settime` and the expiration-count `read` are raw syscalls in
+  `Server` (outside the wrapper layer). Move them into a `TimerFd` wrapper in `network/` returning
+  `Result`.
+- (WEB-13) With `--idle-timeout 0` (disabled) the sweep timerfd is still armed every
+  `sweepInterval` but never read (`timerCallback` returns first). Harmless, but don't arm it.
+- Under ASan (+ `_GLIBCXX_DEBUG`) the `check_write_path.sh` backpressure case fails ("a second client
+  was starved"), on `main` (`ab171df`) as well: the per-request `buf.erase` below keeps the reactor
+  busy past the other client's 3 s budget. Same root cause as the quadratic-erase item.
 
 - `EMFILE` message prints on every discard (rate-limit or drop).
 - `MAX_EVENTS` is 10'000, a guess. Settle by profiling.
