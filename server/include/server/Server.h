@@ -20,6 +20,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <tuple>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
@@ -221,7 +222,8 @@ public:
 
     void closeClientConnection(int fd)
     {
-        m_reactor.remove(fd);
+        std::ignore = m_reactor.remove(
+                fd); // ignore the nodiscard warning, we want to remove the fd from epoll regardless of the result
         m_clients.erase(fd);
     }
 
@@ -318,10 +320,10 @@ private:
                     const auto &done = std::get<http::Done>(parseOutcome);
                     const auto &req = done.request;
 
-                    bool close_conn = !req.shouldKeepAlive();
 
                     http::Response resp(m_router.route(req));
-                    resp.close_connection = close_conn; // ensure the response respects the connection state
+
+                    resp.close_connection = !req.shouldKeepAlive() || resp.close_connection;
 
                     std::string serialized_resp = resp.serialize();
                     if (req.method == http::HttpMethod::HEAD)
@@ -330,7 +332,8 @@ private:
                     }
                     client.queueWrite(std::move(serialized_resp));
                     buf.erase(0, done.consumed_bytes);
-                    if (close_conn)
+
+                    if (resp.close_connection)
                     {
                         client.setReadClosed(true);
                         break;

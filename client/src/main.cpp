@@ -6,13 +6,14 @@ static volatile sig_atomic_t shouldQuit = 0;
 
 void quitProgram(int signum)
 {
+    (void) signum; // Unused parameter
     std::cout << "\nExiting program...\n";
     shouldQuit = 1;
 }
 
 int main(int argc, char **argv)
 {
-    int fd_socket = -1;
+    // int fd_socket = -1;
     int port = 0;
     char *ip = nullptr;
     std::string message;

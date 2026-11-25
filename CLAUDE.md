@@ -175,7 +175,8 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
   Unknown path 404, wrong method 405 + `Allow`, HEAD falls back to the GET handler. Routes live in
   `unordered_map<string, array<optional<function>, MAX_METHODS>>` with transparent lookup. `Server`
   owns a `Router` passed in by `main` (demo routes `GET /`, `POST /echo`), and `clientCallback` sets
-  `resp.close_connection` from `shouldKeepAlive()` after routing. Handlers return owning `Response`s.
+  `resp.close_connection |= !shouldKeepAlive()` after routing. A throwing handler is a 500 + close
+  (WEB-12, caught in `Router::route`). Handlers return owning `Response`s.
 - Static files (WEB-11): `--root` is required (`ServerConfig::rootDirectory` is `std::optional`).
   `main` mounts `StaticFileHandler` on `/static/` with `Router::mount` (exact routes win, longest
   prefix wins, GET/HEAD only, else 405). The handler holds the root as a `shared_ptr<const
@@ -192,17 +193,17 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
-  WEB-11 (done: static files, MIME, `openat2` traversal protection, `Router::mount`, required `--root`,
+  WEB-12 (done: handler exceptions -> 500 + close in `Router::route`, close flags combined in `Server`,
+  `class [[nodiscard]] Result`, `-Wall -Wextra -Wpedantic` on every target). Before that WEB-11 (done: static files, MIME, `openat2` traversal protection, `Router::mount`, required `--root`,
   `static-*` cases in `check_http.sh`). Before that WEB-10 (done: router, 404/405, routing section in `check_http.sh`). Before that WEB-9 (done: strict argument parsing, `check_args.sh`). Before that WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
-  parsing, body section in `check_http.sh`). Next: M3 idle timeouts, after, or together with, a small cleanup ticket (route() exception guard ->
-  500, `[[nodiscard]] Result`, warning flags).
+  parsing, body section in `check_http.sh`). Next: M3 idle timeouts.
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
   `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_args.sh` (WEB-9: CLI validation), `check_http.sh` (WEB-7/WEB-8: GET/HEAD,
   keep-alive, HTTP/1.0, pipelining, error statuses, POST bodies, 413, routing, static files, curl). `check_write_path.sh` and `check_scale.sh`
-  speak HTTP now (backpressure = 100k pipelined requests). All pass on `web-11`. Every script starts the server with a temp `--root` (it is required).
+  speak HTTP now (backpressure = 100k pipelined requests). All pass on `web-12`. Every script starts the server with a temp `--root` (it is required).
   Scripts count connections with `ss`, not server logs. Pass `--max-connections` explicitly.
-- Unit tests: `ctest --test-dir build --output-on-failure` (242 tests on `web-11`, 1 of
+- Unit tests: `ctest --test-dir build --output-on-failure` (248 tests on `web-12`, 1 of
   them `DISABLED_`: repeated `Connection` headers). Add a test with every new parser/router/buffer
   unit; `SocketIo` tests use `socketpair`; parser, response and keep-alive tests are socket-free.
 
@@ -282,19 +283,23 @@ Fixed (WEB-11): static files, MIME, traversal protection via `openat2(RESOLVE_BE
 dotfiles refused, `FileDescriptor::operator bool` explicit, `syscall(OPENAT2_REGULAR, ...)` passing a
 flag as the syscall number (was `read`, EBADF), +86 tests.
 
+Fixed (WEB-12): `Router::route` catches `std::exception` and `...` from handlers -> 500, empty body,
+`close_connection = true`; `Server` closes when `!req.shouldKeepAlive() || resp.close_connection` (an
+intermediate version trusted only the handler flag and broke `Connection: close`, caught by
+`check_http.sh`); `class [[nodiscard]] Result`; `add_compile_options(-Wall -Wextra -Wpedantic)` at top
+level (also reaches GoogleTest); client warnings fixed; +6 `RouterTest` tests.
+
 Open:
 
-- `Server::clientCallback` does not catch exceptions from `Router::route`; a throwing handler
-  terminates the server. Should be a 500.
+- `closeClientConnection` discards with `std::ignore = ...` (only specified for `std::tie` before
+  C++26); the rest of the code uses `static_cast<void>(...)`.
 - Mount 405 is built in both `Router::route` and `StaticFileHandler`.
 - Static files are read whole on the reactor thread with no size cap (`sendfile` profiling ticket).
 
 - `EMFILE` message prints on every discard (rate-limit or drop).
 - `MAX_EVENTS` is 10'000, a guess. Settle by profiling.
 - `accept4` is still called directly in `Server` (outside the wrapper layer).
-- `Result` is not `[[nodiscard]]` (callers use `static_cast<void>(flush(...))`);
-  `error()` on a successful `Result<void>`
-  is undefined behavior; `Error(errno != 0 ? errno : EIO)` fallbacks after `modify()`.
+- `error()` on a successful `Result<void>` is undefined behavior; `Error(errno != 0 ? errno : EIO)` fallbacks after `modify()`.
 - `ReadOutcome::bytes_read` is unused by the caller. Untested `SocketIo` paths:
   `ECONNRESET` on read, the `EINTR` retry, `send` returning 0.
 - Repeated `Connection` header lines are not combined (`getHeaderValue` returns the first):
@@ -308,8 +313,7 @@ Open:
   connection that reused the fd in the same batch (use a generation id in `epoll_event.data`).
 - `flush()` reads `errno` after `closeClientConnection()`; return the `Result` error from
   `modify()` instead. The write buffer has no cap (a non-reading client grows it).
-- `EpollReactor` constructor can throw and `main` does not catch it; warning flags exist only on the
-  test target.
+- `EpollReactor` constructor can throw and `main` does not catch it.
 - `Server::clientCallback` does `buf.erase(0, consumed_bytes)` per pipelined request: quadratic on big
   bursts (the 100k-request backpressure case in `check_write_path.sh` costs ~4 s of CPU). Profiling
   candidate: parse from an offset and compact once after the loop. (The old per-frame

@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <variant>
 
@@ -311,4 +313,75 @@ TEST(RouterMountTest, RouterWithOnlyMountsHas404Fallback)
     r.mount("/static/", [](const Request &) { return tagged("static"); });
     const std::string raw = get("/");
     EXPECT_EQ(r.route(parseOk(raw)).status_code, StatusCode::NotFound);
+}
+
+// ---------- WEB-12: handler exceptions become 500 ----------
+
+namespace
+{
+    Router makeThrowingRouter()
+    {
+        Router r;
+        r.add(HttpMethod::GET, "/std", [](const Request &) -> Response { throw std::runtime_error("boom"); });
+        r.add(HttpMethod::GET, "/alloc", [](const Request &) -> Response { throw std::bad_alloc(); });
+        r.add(HttpMethod::GET, "/int", [](const Request &) -> Response { throw 42; });
+        r.add(HttpMethod::GET, "/ok", okHandler);
+        r.mount("/static/", [](const Request &) -> Response { throw std::runtime_error("mount boom"); });
+        return r;
+    }
+} // namespace
+
+TEST(RouterTest, ThrowingHandlerReturns500)
+{
+    const Router r = makeThrowingRouter();
+    for (const char *target: {"/std", "/alloc"})
+    {
+        const std::string raw = get(target);
+        const Response resp = r.route(parseOk(raw));
+        EXPECT_EQ(resp.status_code, StatusCode::InternalServerError) << target;
+        EXPECT_TRUE(resp.body.empty()) << target << ": exception text must not leak into the body";
+    }
+}
+
+TEST(RouterTest, NonStdExceptionReturns500)
+{
+    const Router r = makeThrowingRouter();
+    const std::string raw = get("/int");
+    EXPECT_EQ(r.route(parseOk(raw)).status_code, StatusCode::InternalServerError);
+}
+
+TEST(RouterTest, ThrowingMountHandlerReturns500)
+{
+    const Router r = makeThrowingRouter();
+    const std::string raw = get("/static/a.css");
+    EXPECT_EQ(r.route(parseOk(raw)).status_code, StatusCode::InternalServerError);
+}
+
+TEST(RouterTest, ThrowingHeadFallbackReturns500)
+{
+    const Router r = makeThrowingRouter();
+    const std::string raw = "HEAD /std HTTP/1.1\r\nHost: x\r\n\r\n";
+    EXPECT_EQ(r.route(parseOk(raw)).status_code, StatusCode::InternalServerError);
+}
+
+// A 500 means the handler's state is unknown: close even when the client asked for keep-alive.
+TEST(RouterTest, ThrowingHandlerRequestsClose)
+{
+    const Router r = makeThrowingRouter();
+    for (const char *target: {"/std", "/int", "/static/a.css"})
+    {
+        const std::string raw = get(target); // HTTP/1.1, no Connection header: keep-alive by default
+        EXPECT_TRUE(r.route(parseOk(raw)).close_connection) << target;
+    }
+}
+
+TEST(RouterTest, RouterStillServesAfterAThrow)
+{
+    const Router r = makeThrowingRouter();
+    const std::string bad = get("/std");
+    static_cast<void>(r.route(parseOk(bad)));
+    const std::string good = get("/ok");
+    const Response resp = r.route(parseOk(good));
+    EXPECT_EQ(resp.status_code, StatusCode::Ok);
+    EXPECT_EQ(resp.body, "hello");
 }

@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 4.3)
 
 project(webserver LANGUAGES CXX)
 
+add_compile_options(-Wall -Wextra -Wpedantic)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
