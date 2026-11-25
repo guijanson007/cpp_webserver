@@ -9,7 +9,8 @@ tested and benchmarked server where every design decision is backed by profiling
 > requests: it parses heads and `Content-Length` bodies (413 over 1 MiB), dispatches
 > them through a small router (exact paths, prefix mounts, 404, 405 with `Allow`), serves
 > static files from `--root` under `/static/` with MIME types and kernel-enforced traversal
-> protection, and supports keep-alive, pipelining and `HEAD`. Idle timeouts are next.
+> protection, and supports keep-alive, pipelining and `HEAD`. A handler that throws gets a
+> 500 instead of taking the server down. Idle timeouts are next.
 > See [Progress](#progress).
 
 ## Platform and design decisions
@@ -20,8 +21,9 @@ tested and benchmarked server where every design decision is backed by profiling
   (C++23) is not used.
 - **Zero runtime dependencies.** Only the standard library and Linux syscalls.
   GoogleTest is a dev-only dependency, fetched by CMake.
-- **No exceptions on I/O paths.** Failures are values: `Result<T, Error>`. One bad
-  connection must never take the server down.
+- **No exceptions on I/O paths.** Failures are values: `Result<T, Error>`, marked
+  `[[nodiscard]]` so a dropped error is a compiler warning. One bad connection must never
+  take the server down: an exception from a route handler becomes a 500 (WEB-12).
 - **No raw `read`/`write`/`epoll_*` outside a thin wrapper layer.**
 - **Single-threaded reactor first.** A worker pool is an optional, late milestone.
 - **Out of scope:** TLS, HTTP/2, WebSockets. To get TLS, put the server behind Nginx
@@ -111,6 +113,10 @@ tested and benchmarked server where every design decision is backed by profiling
 - **Errors.** A `ParseError` becomes the response status with `Connection: close`. The
   connection is marked read-closed, so `flush()` closes it after the buffer drains, and any
   bytes after the bad request are dropped.
+- **Handler exceptions (WEB-12).** `Router::route` catches anything a handler throws
+  (`std::exception` and `...`), logs it to stderr, and answers `500 Internal Server Error`
+  with an empty body and `Connection: close`. The server closes when either the client or
+  the router asks for it.
 
 ### Routing (WEB-10)
 
@@ -179,7 +185,7 @@ tested and benchmarked server where every design decision is backed by profiling
 - Hand-written, incremental parser over `std::string_view`, zero-copy. No llhttp or
   http-parser. **Done for the request line and headers, and wired into the server.**
 - Request-line, header and body size limits (414, 431 and 413 done).
-- Status codes: 400, 404, 405, 413, 431, 500 (all but 500 are returned today).
+- Status codes: 400, 404, 405, 413, 431, 500. **Done (500 since WEB-12).**
 - `Content-Length` request bodies. **Done.**
 - Keep-alive with idle timeouts.
 - Static files with MIME types and path-traversal protection. **Done (WEB-11).**
@@ -204,6 +210,8 @@ first configure so CMake can fetch GoogleTest (dev-only).
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ```
+
+Every target builds with `-Wall -Wextra -Wpedantic` and a clean build has no warnings.
 
 Release build:
 
@@ -244,7 +252,7 @@ Routes: `GET /`, `POST /echo` (demo) and `/static/...` (files from `--root`).
 
 ## Test
 
-Unit tests use GoogleTest and live in a single target, `common_tests` (242 tests, 1 of them a
+Unit tests use GoogleTest and live in a single target, `common_tests` (248 tests, 1 of them a
 disabled known-gap test):
 
 ```sh
@@ -253,6 +261,7 @@ build/tests/common_tests --gtest_filter='SocketIo*' # one suite or test
 build/tests/common_tests --gtest_filter='Parser*'   # HTTP parser tests
 build/tests/common_tests --gtest_filter='Response*:ReasonPhrase*:KeepAlive*'   # WEB-7 tests
 build/tests/common_tests --gtest_filter='RouterTest*'   # WEB-10 tests
+build/tests/common_tests --gtest_filter='RouterTest.*Throw*:RouterTest.*Exception*'   # WEB-12 tests
 build/tests/common_tests --gtest_filter='Mime*:FileReader*:StaticFileHandler*:RouterMount*:ParseRootDirectory*'   # WEB-11 tests
 ```
 
@@ -293,13 +302,13 @@ Planned: `docs/PERFORMANCE.md`.
 
 ## Progress
 
-### Estimated completion: 71%
+### Estimated completion: 75%
 
 ```
-[##############......]  71%   (30 of 42 required items)
+[###############.....]  75%   (33 of 44 required items)
 ```
 
-How it is computed: the checklist below has 42 required items across milestones M1-M5.
+How it is computed: the checklist below has 44 required items across milestones M1-M5.
 Each counts equally. M6 is optional and excluded. This is a rough measure of item count,
 not effort. The HTTP parser and the benchmarking work are likely heavier than the
 average done item, so real progress is probably a bit lower.
@@ -333,6 +342,11 @@ average done item, so real progress is probably a bit lower.
 - [x] `Content-Length` bodies (strict parsing, resumable across partial reads, pipelining-safe)
 - [x] Size limits: 414, 431 and 413 (body over `maxBodySize` refused from the head alone)
 
+**M2 (done, 7/7): status codes (WEB-12)**
+
+- [x] Status codes 400, 404, 405, 413, 431, 500 (500 when a route handler throws; 414, 501 and
+  505 are returned too)
+
 **M3 (partial): routing (WEB-10)**
 
 - [x] Placeholder echo protocol removed
@@ -358,6 +372,9 @@ average done item, so real progress is probably a bit lower.
 - [x] `parseInteger` unit tests (`ParseNumberTest`, 9 tests) and `check_args.sh` (WEB-9)
 - [x] Static file unit tests: `MimeTest` (8), `FileReaderTest` (22), `StaticFileHandlerTest` (33),
   `RouterMountTest` (13), `ParseRootDirectoryTest` (10) (WEB-11)
+- [x] Handler-exception unit tests (`RouterTest`, 6 tests: `std::exception`, `throw 42`, mount, HEAD
+  fallback, close, still serving) (WEB-12)
+- [x] Warning flags (`-Wall -Wextra -Wpedantic`) on every target, zero warnings on a clean build (WEB-12)
 
 Also done and not counted separately: `Result<T, Error>` error handling with concept
 constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end check scripts
@@ -366,17 +383,12 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end che
 
 ### Planned
 
-**M2: HTTP core (6/7 done, listed above)**
-
-- [ ] Status codes 400, 404, 405, 413, 431, 500 (400, 404, 405, 413, 414, 431, 501, 505 are
-  returned today; 500 needs a handler that can fail)
-
 **M3: Routing and static files (9/11, done items listed above)**
 
 - [ ] Keep-alive state machine (keep-alive decision and reuse work; idle timeouts do not)
 - [ ] Idle timeouts without a thread per connection
 
-**M4: Quality (7/11 done, the seven done items are listed above)**
+**M4: Quality (9/13 done, the nine done items are listed above)**
 
 - [ ] Buffer unit tests
 - [ ] GitHub Actions CI (GCC and Clang)
@@ -402,7 +414,7 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end che
 - [x] Strict argument parsing (WEB-9)
 - [ ] Rate-limit the `EMFILE` log message
 - [ ] Move the direct `accept4` call behind the wrapper layer
-- [ ] Mark `Result` `[[nodiscard]]`
+- [x] Mark `Result` `[[nodiscard]]` (WEB-12)
 - [ ] Bound reads per wakeup so one fast sender cannot starve others
 - [ ] Cap the per-connection write buffer
 - [x] Remove the unused `HttpMethod::DELETE` (WEB-9)
@@ -410,9 +422,8 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, six end-to-end che
   `Connection: TE` followed by `Connection: close` is read as keep-alive today, because
   `getHeaderValue` returns only the first match. Enable
   `KeepAliveTest.DISABLED_RepeatedConnectionHeadersAreCombined` when fixed.
-- [ ] Warning flags on the `server` and `common` targets (only tests have them today)
-- [ ] Catch exceptions from route handlers in `Server::clientCallback` and answer 500 (a throwing
-  handler takes the server down today)
+- [x] Warning flags on every target (WEB-12)
+- [x] Catch exceptions from route handlers and answer 500 (WEB-12, in `Router::route`)
 - [ ] Build the mount 405 in one place (both `Router::route` and `StaticFileHandler` do it)
 
 ### Profiling plan
