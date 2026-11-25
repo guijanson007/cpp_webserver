@@ -76,7 +76,8 @@ TEST(ParserTest, ParsesPostAndHead)
 TEST(ParserBodyTest, CompleteBody)
 {
     const std::string input = "POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
-    const Done *d = asDone(run(input));
+    const Outcome o = run(input); // keep the outcome alive: d points into it
+    const Done *d = asDone(o);
     ASSERT_NE(d, nullptr);
     EXPECT_EQ(d->request.body, "hello");
     EXPECT_EQ(d->consumed_bytes, input.size());
@@ -109,7 +110,8 @@ TEST(ParserBodyTest, BodyExactlyAtLimit)
                             .maxHeaderCount = 8,
                             .maxBodySize = 5};
     const std::string input = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
-    const Done *d = asDone(run(input, limits));
+    const Outcome o = run(input, limits);
+    const Done *d = asDone(o);
     ASSERT_NE(d, nullptr);
     EXPECT_EQ(d->request.body, "hello");
 }
@@ -143,11 +145,13 @@ TEST(ParserBodyTest, PipelinedPostThenGet)
 {
     const std::string input = "POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
                               "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
-    const Done *first = asDone(run(input));
+    const Outcome o1 = run(input); // keep the outcome alive: first points into it
+    const Done *first = asDone(o1);
     ASSERT_NE(first, nullptr);
     EXPECT_EQ(first->request.body, "hello");
 
-    const Done *second = asDone(run(std::string_view(input).substr(first->consumed_bytes)));
+    const Outcome o2 = run(std::string_view(input).substr(first->consumed_bytes));
+    const Done *second = asDone(o2);
     ASSERT_NE(second, nullptr);
     EXPECT_EQ(second->request.target, "/next");
 }
@@ -155,7 +159,8 @@ TEST(ParserBodyTest, PipelinedPostThenGet)
 TEST(ParserBodyTest, ZeroLength)
 {
     const std::string input = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
-    const Done *d = asDone(run(input));
+    const Outcome o = run(input); // keep the outcome alive: d points into it
+    const Done *d = asDone(o);
     ASSERT_NE(d, nullptr);
     EXPECT_TRUE(d->request.body.empty());
 }
@@ -165,7 +170,8 @@ TEST(ParserBodyTest, GetAndHeadConsumeNonzeroBodies)
     for (const std::string method: {"GET", "HEAD"})
     {
         const std::string input = method + " / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
-        const Done *d = asDone(run(input));
+        const Outcome o = run(input); // keep the outcome alive: d points into it
+    const Done *d = asDone(o);
         ASSERT_NE(d, nullptr);
         EXPECT_EQ(d->request.body, "abc");
         EXPECT_EQ(d->consumed_bytes, input.size());

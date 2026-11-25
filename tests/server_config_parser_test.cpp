@@ -5,12 +5,15 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <unistd.h>
+#include <utility>
 
+#include "server/ServerConfig.h"
 #include "server/ServerConfigParser.h"
 
 namespace fs = std::filesystem;
@@ -120,4 +123,49 @@ TEST_F(ParseRootDirectoryTest, UnsearchableParentIsPermissionDenied)
     ASSERT_FALSE(r.ok());
     EXPECT_EQ(r.error().code(), EACCES);
     EXPECT_FALSE(r.error().message().empty());
+}
+
+// WEB-13: --idle-timeout validation.
+// API under test (written by the user in server/include/server/ServerConfigParser.h):
+//   static Result<std::chrono::seconds, std::string> ServerConfigParser::parseIdleTimeout(std::string_view);
+// Range 0-3600 seconds; 0 means "no timeout" (the parser's own comment).
+
+using namespace std::chrono_literals;
+
+TEST(ParseIdleTimeoutTest, TypicalValuesAreAccepted)
+{
+    for (auto [text, expected]: {std::pair{"1", 1s}, std::pair{"60", 60s}, std::pair{"3600", 3600s}})
+    {
+        auto r = ServerConfigParser::parseIdleTimeout(text);
+        ASSERT_TRUE(r.ok()) << text << ": " << r.error();
+        EXPECT_EQ(r.value(), expected) << text;
+    }
+}
+
+TEST(ParseIdleTimeoutTest, ZeroIsAcceptedAndMeansDisabled)
+{
+    auto r = ServerConfigParser::parseIdleTimeout("0");
+    ASSERT_TRUE(r.ok()) << r.error();
+    EXPECT_EQ(r.value(), 0s);
+}
+
+TEST(ParseIdleTimeoutTest, AboveOneHourIsRejectedWithRange)
+{
+    auto r = ServerConfigParser::parseIdleTimeout("3601");
+    ASSERT_FALSE(r.ok());
+    EXPECT_NE(r.error().find("3600"), std::string::npos) << r.error();
+}
+
+TEST(ParseIdleTimeoutTest, MalformedValuesAreRejected)
+{
+    for (const char *text: {"", "-1", "abc", "5s", " 5", "5 ", "+5", "1.5", "99999999999999999999"})
+    {
+        auto r = ServerConfigParser::parseIdleTimeout(text);
+        EXPECT_FALSE(r.ok()) << "accepted '" << text << "'";
+    }
+}
+
+TEST(ParseIdleTimeoutTest, DefaultConfigIsSixtySeconds)
+{
+    EXPECT_EQ(ServerConfig{}.idleTimeout, 60s);
 }
