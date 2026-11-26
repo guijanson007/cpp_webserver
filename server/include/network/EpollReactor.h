@@ -32,6 +32,10 @@ namespace network
         EpollReactor(const EpollReactor &) = delete;
         EpollReactor &operator=(const EpollReactor &) = delete;
         ~EpollReactor() = default;
+        EpollReactor(EpollReactor &&) noexcept = default;
+        EpollReactor &operator=(EpollReactor &&) noexcept = default;
+
+        [[nodiscard]] int getEpollFd() const noexcept { return m_epollFd.get(); }
 
         Result<void> add(int fd, uint32_t events, std::function<void(int, uint32_t)> handler)
         {
@@ -41,7 +45,7 @@ namespace network
 
             if (-1 == ::epoll_ctl(m_epollFd.get(), EPOLL_CTL_ADD, fd, &event))
             {
-                std::cerr << "Failed to add file descriptor to epoll instance: " << strerror(errno) << std::endl;
+                std::cerr << "Failed to add file descriptor to epoll instance: " << strerror(errno) << "\n";
                 return Error::from_errno(errno);
             }
             m_handlers[fd] = std::move(handler);
@@ -56,7 +60,7 @@ namespace network
 
             if (-1 == ::epoll_ctl(m_epollFd.get(), EPOLL_CTL_MOD, fd, &event))
             {
-                std::cerr << "Failed to modify file descriptor in epoll instance: " << strerror(errno) << std::endl;
+                std::cerr << "Failed to modify file descriptor in epoll instance: " << strerror(errno) << "\n";
                 return Error::from_errno(errno);
             }
             return {};
@@ -66,7 +70,7 @@ namespace network
         {
             if (-1 == ::epoll_ctl(m_epollFd.get(), EPOLL_CTL_DEL, fd, nullptr))
             {
-                std::cerr << "Failed to remove file descriptor from epoll instance: " << strerror(errno) << std::endl;
+                std::cerr << "Failed to remove file descriptor from epoll instance: " << strerror(errno) << "\n";
                 m_handlers.erase(fd);
                 return Error::from_errno(errno);
             }
@@ -86,7 +90,7 @@ namespace network
                 }
                 if (errno != EINTR)
                 {
-                    std::cerr << "Failed to wait for events: " << strerror(errno) << std::endl;
+                    std::cerr << "Failed to wait for events: " << strerror(errno) << "\n";
                     return Error::from_errno(errno);
                 }
             } while (errno == EINTR);

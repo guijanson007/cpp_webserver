@@ -82,12 +82,12 @@ namespace http
             // std::bad_alloc and other exceptions can be thrown by std::function, std::string, etc.
             catch (const std::exception &e)
             {
-                std::cerr << "Exception during request handling: " << e.what() << std::endl;
+                std::cerr << "Exception during request handling: " << e.what() << "\n";
                 return {StatusCode::InternalServerError, "", "", true};
             }
             catch (...)
             {
-                std::cerr << "Unknown exception during request handling" << std::endl;
+                std::cerr << "Unknown exception during request handling" << "\n";
                 return {StatusCode::InternalServerError, "", "", true};
             }
         }

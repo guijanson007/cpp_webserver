@@ -123,11 +123,11 @@ int main(int argc, char *argv[])
 
     if (auto result = server.start(); !result)
     {
-        std::cerr << std::format("Failed to start server: {}", result.error().message()) << std::endl;
+        std::cerr << std::format("Failed to start server: {}", result.error().message()) << "\n";
         return EXIT_FAILURE;
     }
 
-    std::cout << std::format("Server is listening on port {}...", server.getPort()) << std::endl;
+    std::cout << std::format("Server is listening on port {}...", server.getPort()) << "\n";
     while (true)
     {
         if (!epollReactor.run())
