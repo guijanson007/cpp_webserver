@@ -47,6 +47,9 @@ public:
 
     Server(const Server &) = delete;
     Server &operator=(const Server &) = delete;
+    Server(Server &&) = delete;
+    Server &operator=(Server &&) = delete;
+    ~Server() = default;
 
     Result<void> start()
     {
@@ -155,7 +158,7 @@ public:
                 continue;
             }
 
-            if (static_cast<int>(m_clients.size()) >= m_config.maxConnections)
+            if (std::cmp_greater_equal(m_clients.size(), m_config.maxConnections))
             {
                 std::cerr << "Max connections reached. Closing the new connection.\n";
                 ::close(fd_temp);
@@ -400,7 +403,8 @@ private:
                 {
                     break;
                 }
-                else if (std::holds_alternative<http::Done>(parseOutcome))
+
+                if (std::holds_alternative<http::Done>(parseOutcome))
                 {
                     const auto &done = std::get<http::Done>(parseOutcome);
                     const auto &req = done.request;
@@ -440,7 +444,6 @@ private:
         }
     }
 
-private:
     ServerConfig m_config;
     FileDescriptor m_socket;
     FileDescriptor m_spare_fd;
