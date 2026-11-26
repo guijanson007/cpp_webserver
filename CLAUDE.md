@@ -203,13 +203,14 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
-  WEB-13 (done: idle timeouts with one periodic `timerfd` + LRU list, `--idle-timeout`,
+  WEB-14 (done: `WEBSERVER_SANITIZE` CMake option for ASan + UBSan with `-fno-sanitize-recover=undefined`,
+  `.gitignore` `build*/`; clean baseline with GCC and Clang, no findings). Before that WEB-13 (done: idle timeouts with one periodic `timerfd` + LRU list, `--idle-timeout`,
   `check_idle_timeout.sh`, in-process `ServerIdleTimeoutTest`, ctest `TIMEOUT 30`; M3 complete).
   Before that WEB-12 (done: handler exceptions -> 500 + close in `Router::route`, close flags combined in `Server`,
   `class [[nodiscard]] Result`, `-Wall -Wextra -Wpedantic` on every target). Before that WEB-11 (done: static files, MIME, `openat2` traversal protection, `Router::mount`, required `--root`,
   `static-*` cases in `check_http.sh`). Before that WEB-10 (done: router, 404/405, routing section in `check_http.sh`). Before that WEB-9 (done: strict argument parsing, `check_args.sh`). Before that WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
-  parsing, body section in `check_http.sh`). Next: M4 quality (CI, sanitizers, clang-tidy) or the
-  WEB-13 follow-ups in Known issues.
+  parsing, body section in `check_http.sh`). Next: WEB-15 GitHub Actions CI (GCC + Clang + a sanitizer
+  job), WEB-16 clang-tidy, or the WEB-13 follow-ups in Known issues.
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
   `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_args.sh` (WEB-9: CLI validation), `check_idle_timeout.sh` (WEB-13: idle close, activity
@@ -240,6 +241,12 @@ cmake --build build
 ```
 
 Needs CMake >= 4.3. Formatting: `.clang-format` in repo root.
+
+Sanitizers (WEB-14): `cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DWEBSERVER_SANITIZE=ON`
+(ASan + UBSan on every target, GoogleTest included). Run with
+`ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1`; add `log_path=` to
+see server-side reports, because the scripts delete the server's stderr log. LSan never checks the
+server in the scripts (SIGTERM, no graceful shutdown until M6).
 
 ```
 build/server/server --port 8080 --max-connections 1000 --root ./www   # run (always pass the cap; --root is required)
@@ -307,7 +314,14 @@ Fixed (WEB-13): idle timeouts (see Current architecture); `std::ignore` discard 
 `closeClientConnection` replaced by `static_cast<void>`; ASan stack-use-after-scope in 5
 `ParserBodyTest` tests (pointer into a temporary `Outcome`); +11 tests, `check_idle_timeout.sh`.
 
+Fixed (WEB-14): reproducible sanitizer build (`WEBSERVER_SANITIZE`); ASan + UBSan baseline clean
+(258 tests, 7 scripts, GCC and Clang).
+
 Open:
+
+- (WEB-14) Clang 22 warns inside GoogleTest 1.15.2 (`-Wcharacter-conversion`, `gtest-printers.h:524`)
+  because the top-level `-Wall -Wextra` reaches GoogleTest's own sources. Bump GoogleTest or add
+  `-Wno-character-conversion` to the `gtest` target for Clang before CI (WEB-15).
 
 - Mount 405 is built in both `Router::route` and `StaticFileHandler`.
 - Static files are read whole on the reactor thread with no size cap (`sendfile` profiling ticket).
@@ -321,7 +335,7 @@ Open:
   `Result`.
 - (WEB-13) With `--idle-timeout 0` (disabled) the sweep timerfd is still armed every
   `sweepInterval` but never read (`timerCallback` returns first). Harmless, but don't arm it.
-- Under ASan (+ `_GLIBCXX_DEBUG`) the `check_write_path.sh` backpressure case fails ("a second client
+- Under ASan (+ `_GLIBCXX_DEBUG`; also plain `WEBSERVER_SANITIZE` with GCC and Clang, WEB-14) the `check_write_path.sh` backpressure case fails ("a second client
   was starved"), on `main` (`ab171df`) as well: the per-request `buf.erase` below keeps the reactor
   busy past the other client's 3 s budget. Same root cause as the quadratic-erase item.
 
