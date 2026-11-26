@@ -3,6 +3,8 @@
 # Jobs:
 #   build (gcc, clang)  Debug build, all unit tests; the GCC job also runs scripts/check_http.sh.
 #   sanitize            ASan + UBSan build (WEBSERVER_SANITIZE), all unit tests, a report fails the job.
+#   tidy                clang-tidy 18 over every project TU (WEB-16, scripts/run_clang_tidy.sh); any
+#                       finding fails the job. Local clang-tidy 22 is a superset: run it before pushing.
 #
 # Not run here: check_scale.sh (needs ulimit -n 20000 and 10k sockets), check_reactor.sh (strace +
 # ptrace), check_write_path.sh under ASan (known failure, quadratic buf.erase; profiling ticket).
@@ -66,6 +68,38 @@ jobs:
       - name: End-to-end HTTP check
         if: matrix.e2e
         run: scripts/check_http.sh build/server/server 18080
+
+  tidy:
+    name: clang-tidy
+    runs-on: ubuntu-24.04
+    env:
+      CXX: clang++
+      RUN_CLANG_TIDY: run-clang-tidy-18
+      CLANG_TIDY: clang-tidy-18
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install CMake ${{ env.CMAKE_VERSION }}
+        run: pipx install "cmake==${CMAKE_VERSION}"
+
+      - name: Install clang-tidy 18
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-tidy-18
+
+      - name: Tool versions
+        run: |
+          cmake --version
+          "$CXX" --version
+          "$CLANG_TIDY" --version
+
+      # Configure only: clang-tidy needs compile_commands.json and the GoogleTest headers that
+      # FetchContent downloads at configure time, not object files.
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: clang-tidy
+        run: scripts/run_clang_tidy.sh build
 
   sanitize:
     name: sanitize (asan + ubsan, gcc)

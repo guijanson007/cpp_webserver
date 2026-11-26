@@ -1,0 +1,60 @@
+# WEB-16: clang-tidy configuration. Run it with scripts/run_clang_tidy.sh [build-dir].
+#
+# Base: every bugprone, performance, modernize, cppcoreguidelines and readability check.
+# Every check turned off below has a reason. Do not add a check to this list without one.
+# Suppress a single false positive in code with NOLINTNEXTLINE(<check>) plus a reason, never a
+# bare NOLINT.
+#
+# Must work with clang-tidy 18 (CI, Ubuntu 24.04) and 22 (local Fedora). Disabling a check that one
+# version lacks is harmless.
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  cppcoreguidelines-*,
+  readability-*,
+  -modernize-use-trailing-return-type,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -readability-magic-numbers,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-avoid-unchecked-container-access,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-avoid-do-while,
+  -bugprone-easily-swappable-parameters,
+  -readability-identifier-length,
+  -readability-braces-around-statements,
+  -readability-inconsistent-ifelse-braces,
+  -readability-uppercase-literal-suffix,
+  -readability-implicit-bool-conversion,
+  -readability-function-cognitive-complexity
+
+# Why each check is off:
+#   modernize-use-trailing-return-type          style; the codebase uses leading return types.
+#   *-magic-numbers                             protocol constants (status codes, limits, ports) read
+#                                               better inline; named constexprs exist where they matter.
+#   pro-bounds-pointer-arithmetic               epoll_event arrays and byte buffers handed to syscalls.
+#   pro-bounds-avoid-unchecked-container-access operator[] on containers whose index is already
+#                                               validated (parser, router); .at() would add a throw path.
+#   pro-bounds-constant-array-index             same as above for std::array indexed by an enum value.
+#   pro-type-vararg                             syscall(), ioctl-style C APIs and std::format callers.
+#   pro-type-reinterpret-cast                   the BSD socket API needs sockaddr_in* -> sockaddr*.
+#   avoid-do-while                              do/while is the clearest form of an EINTR retry loop.
+#   bugprone-easily-swappable-parameters        fires on every (int fd, uint32_t events) pair; strong
+#                                               types for these are not worth it in this codebase.
+#   readability-identifier-length               fd, it, ec, ok are idiomatic.
+#   readability-braces-around-statements,
+#   readability-inconsistent-ifelse-braces      layout belongs to .clang-format, not the linter.
+#   readability-uppercase-literal-suffix        style only (1u vs 1U).
+#   readability-implicit-bool-conversion        `events & EPOLLIN` and `if (ptr)` are the idiom for
+#                                               bit masks and std::get_if.
+#   readability-function-cognitive-complexity   the hand-written parser is one linear state machine by
+#                                               design; splitting it to satisfy a score hurts reading.
+
+# Every enabled check is an error: a new finding fails CI.
+WarningsAsErrors: '*'
+
+# Report findings in project headers only (GoogleTest under build/_deps and system headers stay quiet).
+HeaderFilterRegex: '.*/(server|common)/include/.*'
