@@ -1,0 +1,101 @@
+# WEB-15: build and test on every push and pull request to main.
+#
+# Jobs:
+#   build (gcc, clang)  Debug build, all unit tests; the GCC job also runs scripts/check_http.sh.
+#   sanitize            ASan + UBSan build (WEBSERVER_SANITIZE), all unit tests, a report fails the job.
+#
+# Not run here: check_scale.sh (needs ulimit -n 20000 and 10k sockets), check_reactor.sh (strace +
+# ptrace), check_write_path.sh under ASan (known failure, quadratic buf.erase; profiling ticket).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # cmake_minimum_required(VERSION 4.3): pin it instead of trusting the runner image.
+  CMAKE_VERSION: "4.3.4"
+
+jobs:
+  build:
+    name: build (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cxx: g++
+            e2e: true
+          - compiler: clang
+            cxx: clang++
+            e2e: false
+    env:
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake ${{ env.CMAKE_VERSION }}
+        run: pipx install "cmake==${CMAKE_VERSION}"
+
+      - name: Tool versions
+        run: |
+          cmake --version
+          "$CXX" --version
+          uname -r
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure --parallel 4
+
+      - name: End-to-end HTTP check
+        if: matrix.e2e
+        run: scripts/check_http.sh build/server/server 18080
+
+  sanitize:
+    name: sanitize (asan + ubsan, gcc)
+    runs-on: ubuntu-24.04
+    env:
+      CXX: g++
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake ${{ env.CMAKE_VERSION }}
+        run: pipx install "cmake==${CMAKE_VERSION}"
+
+      # ASan's shadow memory layout breaks with the 32-bit mmap ASLR entropy of recent runner
+      # kernels (random "AddressSanitizer:DEADLYSIGNAL" crashes). 28 bits is the old default.
+      - name: Lower mmap ASLR entropy for ASan
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Tool versions
+        run: |
+          cmake --version
+          "$CXX" --version
+          uname -r
+
+      - name: Configure
+        run: cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DWEBSERVER_SANITIZE=ON
+
+      - name: Build
+        run: cmake --build build-asan --parallel
+
+      - name: Unit tests
+        run: ctest --test-dir build-asan --output-on-failure --parallel 4
