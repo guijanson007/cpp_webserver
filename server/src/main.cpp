@@ -16,7 +16,7 @@
 #include "server/ServerConfig.h"
 #include "server/ServerConfigParser.h"
 
-Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
+Result<ServerConfig, std::string> parseArguments(int argc, std::span<char *> argv)
 {
     ServerConfig config{};
 
@@ -101,7 +101,7 @@ int main(int argc, char *argv[])
     network::EpollReactor epollReactor; // might throw (expected if epoll_create1 fails)
 
     // Exception-free parsing
-    auto configResult = parseArguments(argc, argv);
+    auto configResult = parseArguments(argc, std::span(argv, argc));
     if (!configResult)
     {
         std::cerr << std::format("Error parsing arguments: {}\n", configResult.error());
