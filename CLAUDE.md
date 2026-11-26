@@ -90,7 +90,6 @@ plus CPU model and kernel so runs are reproducible.
 common/            shared utilities (FileDescriptor, Result, ...)
 server/net/        reactor, sockets
 server/http/       parser, request/response, router
-client/            small client (load generator is roadmap)
 tests/             GoogleTest
 docs/              PERFORMANCE.md, architecture notes
 ```

@@ -344,7 +344,6 @@ case, see Known cleanups). Run those locally.
 ```
 common/        shared utilities: FileDescriptor, Error, Result, ParseNumber, FileReader
 server/        reactor, sockets, connection handling, HTTP parser, router, static files (http/), main
-client/        small client (a load generator is roadmap only)
 tests/         GoogleTest unit tests
 scripts/       end-to-end check scripts
 docs/tickets/  one ticket per unit of work (WEB-<n>)
