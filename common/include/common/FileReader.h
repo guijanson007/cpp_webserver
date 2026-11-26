@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <filesystem>
+#include <linux/openat2.h> // open_how, RESOLVE_*: glibc < 2.42 (e.g. Ubuntu 24.04) lacks them in <fcntl.h>
 #include <memory>
 #include <string>
 #include <string_view>
