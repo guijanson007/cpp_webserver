@@ -56,6 +56,7 @@ Result<ServerConfig, std::string> parseArguments(int argc, std::span<char *> arg
             {
                 return std::format("Invalid root directory: {}", rootDirectory.error().message());
             }
+
             config.rootDirectory = std::move(rootDirectory.value());
         }
         else if (arg == "--idle-timeout" && i + 1 < argc)

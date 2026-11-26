@@ -31,9 +31,9 @@ namespace network
 
         EpollReactor(const EpollReactor &) = delete;
         EpollReactor &operator=(const EpollReactor &) = delete;
+        EpollReactor(EpollReactor &&) = delete;
+        EpollReactor &operator=(EpollReactor &&) = delete;
         ~EpollReactor() = default;
-        EpollReactor(EpollReactor &&) noexcept = default;
-        EpollReactor &operator=(EpollReactor &&) noexcept = default;
 
         [[nodiscard]] int getEpollFd() const noexcept { return m_epollFd.get(); }
 
