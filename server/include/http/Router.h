@@ -117,7 +117,7 @@ namespace http
             {
                 if (request.method == HttpMethod::HEAD && methods[static_cast<uint8_t>(HttpMethod::GET)])
                 {
-                    return methods[static_cast<uint8_t>(HttpMethod::GET)].value()(request);
+                    return methods[static_cast<uint8_t>(HttpMethod::GET)].value_or({})(request);
                 }
 
                 std::string allowHeader = "Allow: ";
@@ -144,7 +144,7 @@ namespace http
                 return {StatusCode::MethodNotAllowed, "", allowHeader, !request.shouldKeepAlive()};
             }
 
-            return methods[method_idx].value()(request);
+            return methods[method_idx].value_or({})(request);
         }
 
         std::unordered_map<std::string, std::array<std::optional<HandlerFunc>, MAX_METHODS>, StringViewHash,

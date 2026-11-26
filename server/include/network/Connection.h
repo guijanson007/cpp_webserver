@@ -24,7 +24,7 @@ namespace network
     {
     public:
         explicit Connection(int fd, std::list<TimerEntry>::iterator timer_it)
-            : m_timerIterator(timer_it), m_clientFd{fd}, m_readBuffer{}
+            : m_timerIterator(timer_it), m_clientFd{fd}
         {
         }
         Connection(const Connection &) = delete;
