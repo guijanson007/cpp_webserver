@@ -24,6 +24,3 @@ TEST(Error, IntConstructorIsExplicit)
     static_assert(!std::is_convertible_v<int, Error>, "int must not implicitly convert to Error");
     static_assert(std::is_constructible_v<Error, int>);
 }
-
-// WEB-15: deliberate failure to prove CI goes red. Reverted in the next commit.
-TEST(CiRedCheck, DeliberateFailure) { FAIL() << "WEB-15: CI must go red on a failing test"; }
