@@ -98,42 +98,49 @@ int main(int argc, char *argv[])
     /* Optimization: Disable synchronization between C and C++ standard streams for performance. */
     std::ios_base::sync_with_stdio(false);
 
-    network::EpollReactor epollReactor; // might throw (expected if epoll_create1 fails)
-
-    // Exception-free parsing
-    auto configResult = parseArguments(argc, std::span(argv, argc));
-    if (!configResult)
+    try
     {
-        std::cerr << std::format("Error parsing arguments: {}\n", configResult.error());
-        return EXIT_FAILURE;
-    }
-
-    if (!configResult.value().rootDirectory)
-    {
-        std::cerr
-                << "Error: Root directory not specified. Use --root <root_directory> to specify the root directory.\n";
-        return EXIT_FAILURE;
-    }
-
-    // Configure the router
-    http::Router router;
-    registerRoutes(router, configResult.value());
-
-    Server server(configResult.value(), epollReactor, router);
-
-    if (auto result = server.start(); !result)
-    {
-        std::cerr << std::format("Failed to start server: {}", result.error().message()) << "\n";
-        return EXIT_FAILURE;
-    }
-
-    std::cout << std::format("Server is listening on port {}...", server.getPort()) << "\n";
-    while (true)
-    {
-        if (!epollReactor.run())
+        network::EpollReactor epollReactor; // might throw (expected if epoll_create1 fails)
+        // Exception-free parsing
+        auto configResult = parseArguments(argc, std::span(argv, argc));
+        if (!configResult)
         {
-            break;
+            std::cerr << std::format("Error parsing arguments: {}\n", configResult.error());
+            return EXIT_FAILURE;
         }
+
+        if (!configResult.value().rootDirectory)
+        {
+            std::cerr << "Error: Root directory not specified. Use --root <root_directory> to specify the root "
+                         "directory.\n";
+            return EXIT_FAILURE;
+        }
+
+        // Configure the router
+        http::Router router;
+        registerRoutes(router, configResult.value());
+
+        Server server(configResult.value(), epollReactor, router);
+
+        if (auto result = server.start(); !result)
+        {
+            std::cerr << std::format("Failed to start server: {}", result.error().message()) << "\n";
+            return EXIT_FAILURE;
+        }
+
+        std::cout << std::format("Server is listening on port {}...", server.getPort()) << "\n";
+        while (true)
+        {
+            if (!epollReactor.run())
+            {
+                break;
+            }
+        }
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << std::format("Failed to create EpollReactor: {}\n", e.what());
+        return EXIT_FAILURE;
     }
 
     return EXIT_SUCCESS;
