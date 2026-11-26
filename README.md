@@ -11,7 +11,8 @@ tested and benchmarked server where every design decision is backed by profiling
 > static files from `--root` under `/static/` with MIME types and kernel-enforced traversal
 > protection, and supports keep-alive, pipelining and `HEAD`. A handler that throws gets a
 > 500 instead of taking the server down. Idle keep-alive connections are closed after
-> `--idle-timeout` seconds (WEB-13), which completes M3. Quality work (CI, sanitizers) is next.
+> `--idle-timeout` seconds (WEB-13), which completes M3. An opt-in ASan + UBSan build runs every
+> test and check script clean (WEB-14). CI and clang-tidy are next.
 > See [Progress](#progress).
 
 ## Platform and design decisions
@@ -220,7 +221,25 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ```
 
-Every target builds with `-Wall -Wextra -Wpedantic` and a clean build has no warnings.
+Every target builds with `-Wall -Wextra -Wpedantic` and a clean GCC build has no warnings
+(Clang 22 warns once inside GoogleTest, see Known cleanups).
+
+Sanitizer build (AddressSanitizer + UndefinedBehaviorSanitizer, off by default, WEB-14):
+
+```sh
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DWEBSERVER_SANITIZE=ON
+cmake --build build-asan
+export ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1
+ctest --test-dir build-asan --output-on-failure
+for s in scripts/check_*.sh; do "$s" build-asan/server/server; done
+```
+
+The flags reach every target, GoogleTest included. UBSan is built with
+`-fno-sanitize-recover=undefined`, so undefined behaviour aborts and fails the test instead of
+only printing. With GCC and Clang, all unit tests and scripts pass with no sanitizer report,
+except the `check_write_path.sh` backpressure case, which is too slow under ASan (see Known
+cleanups). LeakSanitizer only checks the unit tests: the scripts stop the server with SIGTERM,
+which skips the exit-time leak check until graceful shutdown exists (M6).
 
 Release build:
 
@@ -315,10 +334,10 @@ Planned: `docs/PERFORMANCE.md`.
 
 ## Progress
 
-### Estimated completion: 81%
+### Estimated completion: 83%
 
 ```
-[################....]  81%   (38 of 47 required items)
+[#################...]  83%   (39 of 47 required items)
 ```
 
 How it is computed: the checklist below has 47 required items across milestones M1-M5.
@@ -397,6 +416,8 @@ average done item, so real progress is probably a bit lower.
 - [x] Warning flags (`-Wall -Wextra -Wpedantic`) on every target, zero warnings on a clean build (WEB-12)
 - [x] Idle-timeout unit tests: `ParseIdleTimeoutTest` (5) and `ServerIdleTimeoutTest` (6, in-process
   server on loopback) (WEB-13)
+- [x] ASan and UBSan builds: `-DWEBSERVER_SANITIZE=ON`, all tests and scripts clean with GCC and
+  Clang (WEB-14)
 
 Also done and not counted separately: `Result<T, Error>` error handling with concept
 constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, seven end-to-end check scripts
@@ -405,11 +426,10 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, seven end-to-end c
 
 ### Planned
 
-**M4: Quality (10/14 done, the ten done items are listed above)**
+**M4: Quality (11/14 done, the eleven done items are listed above)**
 
 - [ ] Buffer unit tests
 - [ ] GitHub Actions CI (GCC and Clang)
-- [ ] ASan and UBSan builds
 - [ ] clang-tidy configuration
 
 **M5: Polish (0/5)**
@@ -445,6 +465,10 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, seven end-to-end c
 - [ ] Idle sweep: pop a timer entry whose connection is missing instead of looping forever (WEB-13)
 - [ ] Move the `timerfd` calls in `Server` behind a `TimerFd` wrapper (WEB-13)
 - [ ] Request-head deadline against slowloris (a trickling client keeps resetting its idle timer)
+- [ ] `check_write_path.sh` backpressure fails under ASan: the per-request `buf.erase` is quadratic
+  on 100k pipelined requests (WEB-13, WEB-14; profiling ticket)
+- [ ] Clang 22 warns inside GoogleTest 1.15.2 (`-Wcharacter-conversion` in `gtest-printers.h`):
+  bump GoogleTest or silence it on the `gtest` target (WEB-14, needed for WEB-15 CI)
 
 ### Profiling plan
 
