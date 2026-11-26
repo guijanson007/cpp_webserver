@@ -138,7 +138,7 @@ TEST_F(FileReaderTest, BinaryContentIsByteExact)
 
 TEST_F(FileReaderTest, LargeFileIsReadCompletely)
 {
-    std::string big(3 * 1024 * 1024 + 17, '\0');
+    std::string big((3 * 1024 * 1024) + 17, '\0');
     for (size_t i = 0; i < big.size(); ++i)
     {
         big[i] = static_cast<char>('a' + (i % 26));

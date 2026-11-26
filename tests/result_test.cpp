@@ -1,3 +1,4 @@
+#include <array>
 #include <cerrno>
 #include <gtest/gtest.h>
 #include <memory>
@@ -63,8 +64,8 @@ TEST(Result, MoveOnlyValue)
 
 TEST(Result, FileDescriptorIsClosedOnce)
 {
-    int fds[2];
-    ASSERT_EQ(::pipe(fds), 0);
+    std::array<int, 2> fds{};
+    ASSERT_EQ(::pipe(fds.data()), 0);
     ::close(fds[1]);
     {
         Result<FileDescriptor> r = FileDescriptor(fds[0]);

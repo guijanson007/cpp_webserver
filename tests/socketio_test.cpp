@@ -1,3 +1,4 @@
+#include <array>
 #include <cerrno>
 #include <gtest/gtest.h>
 #include <string>
@@ -19,8 +20,8 @@ namespace
     protected:
         void SetUp() override
         {
-            int fds[2];
-            ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds), 0);
+            std::array<int, 2> fds{};
+            ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds.data()), 0);
             local = FileDescriptor(fds[0]);
             peer = FileDescriptor(fds[1]);
         }
@@ -34,15 +35,15 @@ namespace
         [[nodiscard]] std::string peerDrain() const
         {
             std::string out;
-            char tmp[65536];
+            std::array<char, 65536> tmp{};
             for (;;)
             {
-                const ssize_t r = ::recv(peer.get(), tmp, sizeof(tmp), 0);
+                const ssize_t r = ::recv(peer.get(), tmp.data(), tmp.size(), 0);
                 if (r <= 0)
                 {
                     break;
                 }
-                out.append(tmp, static_cast<size_t>(r));
+                out.append(tmp.data(), static_cast<size_t>(r));
             }
             return out;
         }
@@ -164,7 +165,7 @@ TEST_F(SocketIoTest, WriteEmptyBufferIsZeroBytesOk)
 TEST_F(SocketIoTest, WriteToFullSocketIsPartialNotAnError)
 {
     // Far bigger than any AF_UNIX socket buffer, and the peer is not reading.
-    std::string original(16 * 1024 * 1024, '\0');
+    std::string original(size_t{16} * 1024 * 1024, '\0');
     for (size_t i = 0; i < original.size(); ++i)
     {
         original[i] = static_cast<char>('a' + (i % 23));

@@ -25,8 +25,8 @@ namespace
     {
         const size_t sep = raw.find("\r\n\r\n");
         if (sep == std::string::npos)
-            return {raw, {}};
-        return {raw.substr(0, sep), raw.substr(sep + 4)};
+            return {.head = raw, .body = {}};
+        return {.head = raw.substr(0, sep), .body = raw.substr(sep + 4)};
     }
 
     bool hasLine(const std::string &head, std::string_view line)
