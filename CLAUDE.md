@@ -117,6 +117,7 @@ server/src/main.cpp                      wiring only
 tests/                                   GoogleTest (FetchContent): error, result, socketio, parser, response, request (keep-alive), router, mime, file_reader, static_file_handler, server_config_parser, server_idle_timeout tests
 scripts/check_*.sh                       WEB-1..WEB-4 and WEB-7 checks (see Workflow conventions)
 docs/tickets/WEB-<n>.md                  tickets from /next_task
+.github/workflows/ci.yml                 CI (WEB-15): gcc + clang build/ctest, check_http.sh, ASan+UBSan ctest
 ```
 
 ## Current architecture (after WEB-13)
@@ -203,14 +204,17 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
+  WEB-15 (done: GitHub Actions CI, `ubuntu-24.04`, CMake 4.3.4 via `pipx`; `build (gcc)` = ctest +
+  `check_http.sh`, `build (clang)` = ctest, `sanitize` = GCC ASan + UBSan ctest; gtest
+  `-Wno-character-conversion`; `<linux/openat2.h>` in `FileReader.h` for glibc 2.39). Before that
   WEB-14 (done: `WEBSERVER_SANITIZE` CMake option for ASan + UBSan with `-fno-sanitize-recover=undefined`,
   `.gitignore` `build*/`; clean baseline with GCC and Clang, no findings). Before that WEB-13 (done: idle timeouts with one periodic `timerfd` + LRU list, `--idle-timeout`,
   `check_idle_timeout.sh`, in-process `ServerIdleTimeoutTest`, ctest `TIMEOUT 30`; M3 complete).
   Before that WEB-12 (done: handler exceptions -> 500 + close in `Router::route`, close flags combined in `Server`,
   `class [[nodiscard]] Result`, `-Wall -Wextra -Wpedantic` on every target). Before that WEB-11 (done: static files, MIME, `openat2` traversal protection, `Router::mount`, required `--root`,
   `static-*` cases in `check_http.sh`). Before that WEB-10 (done: router, 404/405, routing section in `check_http.sh`). Before that WEB-9 (done: strict argument parsing, `check_args.sh`). Before that WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
-  parsing, body section in `check_http.sh`). Next: WEB-15 GitHub Actions CI (GCC + Clang + a sanitizer
-  job), WEB-16 clang-tidy, or the WEB-13 follow-ups in Known issues.
+  parsing, body section in `check_http.sh`). Next: WEB-16 clang-tidy (as a CI job), buffer unit
+  tests, or the WEB-13 follow-ups in Known issues.
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
   `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_args.sh` (WEB-9: CLI validation), `check_idle_timeout.sh` (WEB-13: idle close, activity
@@ -256,7 +260,13 @@ scripts/check_write_path.sh [server-binary] [port]        # check scripts defaul
 ```
 
 All tests live in the single `common_tests` target (`tests/CMakeLists.txt`); add new
-test files to its source list. No CI, README or Cursor/Copilot rules exist yet (M4/M5).
+test files to its source list. No Cursor/Copilot rules exist.
+
+CI (WEB-15): `.github/workflows/ci.yml` on push/PR to `main`. The runners are the oldest supported
+toolchain (Ubuntu 24.04: glibc 2.39, GCC 13, Clang 18), older than local Fedora (glibc 2.43, GCC 16,
+Clang 22): include kernel UAPI headers (e.g. `<linux/openat2.h>`) explicitly rather than relying on
+new glibc. Not in CI: `check_scale.sh`, `check_reactor.sh`, `check_write_path.sh` under ASan. The
+sanitize job lowers `vm.mmap_rnd_bits` to 28 (ASan vs high ASLR entropy). No `-Werror` yet.
 
 ## Known issues (M1 backlog)
 
@@ -317,11 +327,13 @@ Fixed (WEB-13): idle timeouts (see Current architecture); `std::ignore` discard 
 Fixed (WEB-14): reproducible sanitizer build (`WEBSERVER_SANITIZE`); ASan + UBSan baseline clean
 (258 tests, 7 scripts, GCC and Clang).
 
+Fixed (WEB-15): Clang 22 warning inside GoogleTest (`-Wno-character-conversion` on the gtest/gmock
+targets, probed with `check_cxx_compiler_flag`); `FileReader.h` did not compile on glibc < 2.42
+(`open_how`/`RESOLVE_*` not in `<fcntl.h>`, found by the first CI run).
+
 Open:
 
-- (WEB-14) Clang 22 warns inside GoogleTest 1.15.2 (`-Wcharacter-conversion`, `gtest-printers.h:524`)
-  because the top-level `-Wall -Wextra` reaches GoogleTest's own sources. Bump GoogleTest or add
-  `-Wno-character-conversion` to the `gtest` target for Clang before CI (WEB-15).
+- (WEB-15) No `-Werror` in CI yet; add it now that GCC 13/16 and Clang 18/22 are warning-free.
 
 - Mount 405 is built in both `Router::route` and `StaticFileHandler`.
 - Static files are read whole on the reactor thread with no size cap (`sendfile` profiling ticket).

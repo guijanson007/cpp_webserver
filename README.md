@@ -1,5 +1,7 @@
 # Epoll HTTP Server in C++20
 
+[![CI](https://github.com/guijanson007/cpp_webserver/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/guijanson007/cpp_webserver/actions/workflows/ci.yml)
+
 A Linux-only HTTP/1.1 server built on a hand-written `epoll` reactor. It is both a
 resume project and a vehicle for learning modern C++20. The goal is a finished,
 tested and benchmarked server where every design decision is backed by profiling data.
@@ -12,7 +14,8 @@ tested and benchmarked server where every design decision is backed by profiling
 > protection, and supports keep-alive, pipelining and `HEAD`. A handler that throws gets a
 > 500 instead of taking the server down. Idle keep-alive connections are closed after
 > `--idle-timeout` seconds (WEB-13), which completes M3. An opt-in ASan + UBSan build runs every
-> test and check script clean (WEB-14). CI and clang-tidy are next.
+> test and check script clean (WEB-14). GitHub Actions builds and tests every push and pull
+> request with GCC, Clang and ASan + UBSan (WEB-15). clang-tidy is next.
 > See [Progress](#progress).
 
 ## Platform and design decisions
@@ -221,8 +224,10 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ```
 
-Every target builds with `-Wall -Wextra -Wpedantic` and a clean GCC build has no warnings
-(Clang 22 warns once inside GoogleTest, see Known cleanups).
+Every target builds with `-Wall -Wextra -Wpedantic`, and a clean build has no warnings with
+GCC or Clang. GoogleTest's own targets get `-Wno-character-conversion` when the compiler knows
+it (Clang 21+ warns inside GoogleTest 1.15.2). The oldest toolchain tested is the CI one:
+Ubuntu 24.04 with glibc 2.39, GCC 13 and Clang 18.
 
 Sanitizer build (AddressSanitizer + UndefinedBehaviorSanitizer, off by default, WEB-14):
 
@@ -319,6 +324,21 @@ These start the server themselves. Each takes `[server-binary] [port]` and defau
 The scripts count connections with `ss`, not server logs. All of them start the server with a
 temporary `--root`.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request to `main` (WEB-15), on
+`ubuntu-24.04` with CMake 4.3.4 pinned through `pipx`:
+
+| Job | What it runs |
+| --- | --- |
+| `build (gcc)` | Debug build, all unit tests, `scripts/check_http.sh` |
+| `build (clang)` | Debug build, all unit tests |
+| `sanitize (asan + ubsan, gcc)` | `-DWEBSERVER_SANITIZE=ON` build, all unit tests with `abort_on_error` / `halt_on_error`, so any report fails the job |
+
+Not run in CI: `check_scale.sh` (needs `ulimit -n 20000` and 10k sockets), `check_reactor.sh`
+(needs `strace` and ptrace), and `check_write_path.sh` under ASan (known slow backpressure
+case, see Known cleanups). Run those locally.
+
 ## Repository layout
 
 ```
@@ -334,10 +354,10 @@ Planned: `docs/PERFORMANCE.md`.
 
 ## Progress
 
-### Estimated completion: 83%
+### Estimated completion: 85%
 
 ```
-[#################...]  83%   (39 of 47 required items)
+[#################...]  85%   (40 of 47 required items)
 ```
 
 How it is computed: the checklist below has 47 required items across milestones M1-M5.
@@ -418,6 +438,8 @@ average done item, so real progress is probably a bit lower.
   server on loopback) (WEB-13)
 - [x] ASan and UBSan builds: `-DWEBSERVER_SANITIZE=ON`, all tests and scripts clean with GCC and
   Clang (WEB-14)
+- [x] GitHub Actions CI: GCC and Clang builds with unit tests, `check_http.sh`, and an ASan + UBSan
+  job (WEB-15)
 
 Also done and not counted separately: `Result<T, Error>` error handling with concept
 constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, seven end-to-end check scripts
@@ -426,10 +448,9 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, seven end-to-end c
 
 ### Planned
 
-**M4: Quality (11/14 done, the eleven done items are listed above)**
+**M4: Quality (12/14 done, the twelve done items are listed above)**
 
 - [ ] Buffer unit tests
-- [ ] GitHub Actions CI (GCC and Clang)
 - [ ] clang-tidy configuration
 
 **M5: Polish (0/5)**
@@ -467,8 +488,10 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, seven end-to-end c
 - [ ] Request-head deadline against slowloris (a trickling client keeps resetting its idle timer)
 - [ ] `check_write_path.sh` backpressure fails under ASan: the per-request `buf.erase` is quadratic
   on 100k pipelined requests (WEB-13, WEB-14; profiling ticket)
-- [ ] Clang 22 warns inside GoogleTest 1.15.2 (`-Wcharacter-conversion` in `gtest-printers.h`):
-  bump GoogleTest or silence it on the `gtest` target (WEB-14, needed for WEB-15 CI)
+- [x] Clang 22 warns inside GoogleTest 1.15.2 (`-Wcharacter-conversion` in `gtest-printers.h`):
+  silenced on GoogleTest's own targets only (WEB-15)
+- [x] `FileReader.h` did not build on glibc < 2.42 (`open_how` and `RESOLVE_*` missing from
+  `<fcntl.h>`): includes `<linux/openat2.h>` now (WEB-15, found by the first CI run)
 
 ### Profiling plan
 

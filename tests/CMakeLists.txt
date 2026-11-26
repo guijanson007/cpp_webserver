@@ -10,6 +10,18 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
+# Clang 21+ warns inside GoogleTest 1.15.2 itself (gtest-printers.h, char8_t -> char32_t),
+# because the top-level -Wall -Wextra reaches its sources. Silence only that warning, only
+# on GoogleTest's own targets. Probe the positive form: GCC accepts any -Wno-<unknown>, and
+# older Clang warns about an unknown -Wno- flag.
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag(-Wcharacter-conversion WEBSERVER_HAS_WCHARACTER_CONVERSION)
+if(WEBSERVER_HAS_WCHARACTER_CONVERSION)
+    foreach(gtest_target gtest gtest_main gmock gmock_main)
+        target_compile_options(${gtest_target} PRIVATE -Wno-character-conversion)
+    endforeach()
+endif()
+
 include(GoogleTest)
 
 add_executable(common_tests
