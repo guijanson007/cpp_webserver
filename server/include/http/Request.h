@@ -47,7 +47,7 @@ namespace http
         std::string_view body;
         std::string_view target;
         std::string_view version;
-        HttpMethod method;
+        HttpMethod method{};
 
         [[nodiscard]] std::optional<std::string_view> getHeaderValue(std::string_view name) const
         {
@@ -118,10 +118,7 @@ namespace http
             {
                 return has_keep_alive && !has_close;
             }
-            else
-            {
-                return !has_close;
-            }
+            return !has_close;
         }
     };
 } // namespace http
