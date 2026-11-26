@@ -43,7 +43,7 @@ jobs:
     env:
       CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install CMake ${{ env.CMAKE_VERSION }}
         run: pipx install "cmake==${CMAKE_VERSION}"
@@ -75,7 +75,7 @@ jobs:
       ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install CMake ${{ env.CMAKE_VERSION }}
         run: pipx install "cmake==${CMAKE_VERSION}"
