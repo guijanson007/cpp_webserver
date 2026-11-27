@@ -116,7 +116,9 @@ server/src/main.cpp                      wiring only
 tests/                                   GoogleTest (FetchContent): error, result, socketio, parser, response, request (keep-alive), router, mime, file_reader, static_file_handler, server_config_parser, server_idle_timeout tests
 scripts/check_*.sh                       WEB-1..WEB-4 and WEB-7 checks (see Workflow conventions)
 docs/tickets/WEB-<n>.md                  tickets from /next_task
-.github/workflows/ci.yml                 CI (WEB-15): gcc + clang build/ctest, check_http.sh, ASan+UBSan ctest
+.github/workflows/ci.yml                 CI (WEB-15): gcc + clang build/ctest, check_http.sh, ASan+UBSan ctest, clang-tidy (WEB-16)
+.clang-tidy, tests/.clang-tidy           clang-tidy checks (WEB-16): every disabled check has a reason; WarningsAsErrors '*'
+scripts/run_clang_tidy.sh                run-clang-tidy over server/, common/, tests/ TUs (WEB-16)
 ```
 
 ## Current architecture (after WEB-13)
@@ -197,12 +199,17 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
 - `Connection` owns its `FileDescriptor`, read/write buffers and its timer-list iterator. Closing = `reactor.remove(fd)`
   then erase from the map (the destructor closes the fd; never call raw `close` on an
   fd a `Connection` owns).
-- `main` constructs reactor then server, `server.start()`, `while (reactor.run())`.
+- `main` constructs reactor then server, `server.start()`, `while (reactor.run())`, all inside one
+  `try` that prints `Fatal: <what>` and exits 1 (WEB-16). The startup line is flushed explicitly
+  (`check_args.sh` reads it from a redirected stdout). `Server` and `EpollReactor` delete copy and move
+  (`[this]` handlers in the reactor).
 - Event arrays are owned by the reactor (`MAX_EVENTS` constexpr member).
 
 ## Workflow conventions
 
 - Tickets: `/next_task` writes `WEB-<n>`; put the id in every commit message. Latest:
+  WEB-16 (done: clang-tidy, `.clang-tidy` + `tests/.clang-tidy`, `scripts/run_clang_tidy.sh`, CI job
+  `clang-tidy` with clang-tidy 18; all findings fixed, no `NOLINT`; `client/` removed). Before that
   WEB-15 (done: GitHub Actions CI, `ubuntu-24.04`, CMake 4.3.4 via `pipx`; `build (gcc)` = ctest +
   `check_http.sh`, `build (clang)` = ctest, `sanitize` = GCC ASan + UBSan ctest; gtest
   `-Wno-character-conversion`; `<linux/openat2.h>` in `FileReader.h` for glibc 2.39). Before that
@@ -212,8 +219,8 @@ docs/tickets/WEB-<n>.md                  tickets from /next_task
   Before that WEB-12 (done: handler exceptions -> 500 + close in `Router::route`, close flags combined in `Server`,
   `class [[nodiscard]] Result`, `-Wall -Wextra -Wpedantic` on every target). Before that WEB-11 (done: static files, MIME, `openat2` traversal protection, `Router::mount`, required `--root`,
   `static-*` cases in `check_http.sh`). Before that WEB-10 (done: router, 404/405, routing section in `check_http.sh`). Before that WEB-9 (done: strict argument parsing, `check_args.sh`). Before that WEB-8 (done: `Content-Length` bodies, 413, `Transfer-Encoding` 501, read-result check before
-  parsing, body section in `check_http.sh`). Next: WEB-16 clang-tidy (as a CI job), buffer unit
-  tests, or the WEB-13 follow-ups in Known issues.
+  parsing, body section in `check_http.sh`). Next: `-Werror` in CI, buffer unit tests (last M4
+  item), or the WEB-13 follow-ups in Known issues.
 - Verification scripts live in `scripts/`: `check_connection_limit.sh` (WEB-1),
   `check_reactor.sh` (WEB-2, uses strace and `ss`), `check_write_path.sh` (WEB-3),
   `check_scale.sh` (WEB-4: cap, 10k idle connections, fd exhaustion), `check_args.sh` (WEB-9: CLI validation), `check_idle_timeout.sh` (WEB-13: idle close, activity
@@ -257,6 +264,11 @@ ctest --test-dir build --output-on-failure                # all unit tests
 build/tests/common_tests --gtest_filter='SocketIo*'       # one suite/test (binary: common_tests)
 scripts/check_write_path.sh [server-binary] [port]        # check scripts default to build/server/server, port 8080
 ```
+
+clang-tidy (WEB-16): `scripts/run_clang_tidy.sh [build-dir]` (needs a configured build; exit 0 = clean).
+CI runs clang-tidy 18; local clang-tidy 22 reports a superset (e.g. designated initializers, integer
+sign comparison), so run it locally before pushing. Fix findings or `NOLINTNEXTLINE(<check>) // reason`;
+never disable a check without a reason in `.clang-tidy`.
 
 All tests live in the single `common_tests` target (`tests/CMakeLists.txt`); add new
 test files to its source list. No Cursor/Copilot rules exist.
@@ -330,10 +342,20 @@ Fixed (WEB-15): Clang 22 warning inside GoogleTest (`-Wno-character-conversion` 
 targets, probed with `check_cxx_compiler_flag`); `FileReader.h` did not compile on glibc < 2.42
 (`open_how`/`RESOLVE_*` not in `<fcntl.h>`, found by the first CI run).
 
+Fixed (WEB-16): clang-tidy clean. `Result<void>::error()` on a success was UB (now throws
+`std::bad_optional_access`, like `Result<T>::error()`; no longer `noexcept`); `EpollReactor`
+constructor exception escaped `main` (now caught); `Server` was implicitly movable with `[this]`
+handlers registered (copy and move deleted on `Server` and `EpollReactor`); `std::endl` -> `"\n"`
+dropped the startup-line flush (explicit `std::flush`); `registerRoutes` takes the root path;
+`Router::dispatchExact` checks the method index bound first and binds the handler by reference (no
+per-request `std::function` copy); unused `client/` removed (it sent 1028 bytes of NUL padding).
+
 Open:
 
 - (WEB-15) No `-Werror` in CI yet; add it now that GCC 13/16 and Clang 18/22 are warning-free.
 
+- (WEB-16) The out-of-range `method_idx` branch in `Router::dispatchExact` answers 405 with a fixed
+  `Allow: GET, HEAD, POST`, not the path's methods. Unreachable today (parser returns 501).
 - Mount 405 is built in both `Router::route` and `StaticFileHandler`.
 - Static files are read whole on the reactor thread with no size cap (`sendfile` profiling ticket).
 - (WEB-13) `Server::timerCallback` sweep loop `while (front().expiresAt <= now)
@@ -353,7 +375,7 @@ Open:
 - `EMFILE` message prints on every discard (rate-limit or drop).
 - `MAX_EVENTS` is 10'000, a guess. Settle by profiling.
 - `accept4` is still called directly in `Server` (outside the wrapper layer).
-- `error()` on a successful `Result<void>` is undefined behavior; `Error(errno != 0 ? errno : EIO)` fallbacks after `modify()`.
+- `Error(errno != 0 ? errno : EIO)` fallbacks after `modify()`.
 - `ReadOutcome::bytes_read` is unused by the caller. Untested `SocketIo` paths:
   `ECONNRESET` on read, the `EINTR` retry, `send` returning 0.
 - Repeated `Connection` header lines are not combined (`getHeaderValue` returns the first):
@@ -367,7 +389,6 @@ Open:
   connection that reused the fd in the same batch (use a generation id in `epoll_event.data`).
 - `flush()` reads `errno` after `closeClientConnection()`; return the `Result` error from
   `modify()` instead. The write buffer has no cap (a non-reading client grows it).
-- `EpollReactor` constructor can throw and `main` does not catch it.
 - `Server::clientCallback` does `buf.erase(0, consumed_bytes)` per pipelined request: quadratic on big
   bursts (the 100k-request backpressure case in `check_write_path.sh` costs ~4 s of CPU). Profiling
   candidate: parse from an offset and compact once after the loop. (The old per-frame
