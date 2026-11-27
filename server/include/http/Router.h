@@ -112,29 +112,34 @@ namespace http
                                                     const Request &request)
         {
             const auto method_idx = static_cast<uint8_t>(request.method);
+            const auto &handler = methods[method_idx];
 
-            if (method_idx >= MAX_METHODS || !methods[method_idx])
+            if (method_idx >= MAX_METHODS || !handler)
             {
-                if (request.method == HttpMethod::HEAD && methods[static_cast<uint8_t>(HttpMethod::GET)])
+                const auto &getHandler = methods[static_cast<uint8_t>(HttpMethod::GET)];
+                const auto &headHandler = methods[static_cast<uint8_t>(HttpMethod::HEAD)];
+                const auto &postHandler = methods[static_cast<uint8_t>(HttpMethod::POST)];
+
+                if (request.method == HttpMethod::HEAD && getHandler.has_value())
                 {
-                    return methods[static_cast<uint8_t>(HttpMethod::GET)].value_or({})(request);
+                    return getHandler.value()(request);
                 }
 
                 std::string allowHeader = "Allow: ";
                 bool hasPrevious = false;
 
-                if (methods[static_cast<uint8_t>(HttpMethod::GET)])
+                if (getHandler.has_value())
                 {
                     allowHeader += "GET, HEAD";
                     hasPrevious = true;
                 }
-                else if (methods[static_cast<uint8_t>(HttpMethod::HEAD)])
+                else if (headHandler.has_value())
                 {
                     allowHeader += "HEAD";
                     hasPrevious = true;
                 }
 
-                if (methods[static_cast<uint8_t>(HttpMethod::POST)])
+                if (postHandler.has_value())
                 {
                     if (hasPrevious)
                         allowHeader += ", ";
@@ -144,7 +149,7 @@ namespace http
                 return {StatusCode::MethodNotAllowed, "", allowHeader, !request.shouldKeepAlive()};
             }
 
-            return methods[method_idx].value_or({})(request);
+            return handler.value()(request);
         }
 
         std::unordered_map<std::string, std::array<std::optional<HandlerFunc>, MAX_METHODS>, StringViewHash,
