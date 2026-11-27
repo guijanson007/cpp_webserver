@@ -113,9 +113,14 @@ namespace http
         {
             const auto method_idx = static_cast<uint8_t>(request.method);
 
-            const auto &handler = method_idx < MAX_METHODS ? methods[method_idx] : std::nullopt;
+            if (method_idx >= MAX_METHODS)
+            {
+                return {StatusCode::MethodNotAllowed, "", "Allow: GET, HEAD, POST", !request.shouldKeepAlive()};
+            }
 
-            if (method_idx >= MAX_METHODS || !methods[method_idx])
+            const auto &handler = methods[method_idx];
+
+            if (!handler.has_value())
             {
                 const auto &getHandler = methods[static_cast<uint8_t>(HttpMethod::GET)];
                 const auto &headHandler = methods[static_cast<uint8_t>(HttpMethod::HEAD)];
@@ -148,11 +153,6 @@ namespace http
                 }
 
                 return {StatusCode::MethodNotAllowed, "", allowHeader, !request.shouldKeepAlive()};
-            }
-
-            if (!handler.has_value())
-            {
-                return {StatusCode::MethodNotAllowed, "", "", !request.shouldKeepAlive()};
             }
 
             return handler.value()(request);
