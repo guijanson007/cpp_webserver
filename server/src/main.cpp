@@ -143,7 +143,7 @@ int main(int argc, char *argv[])
     }
     catch (const std::exception &e)
     {
-        std::cerr << std::format("Failed to create EpollReactor: {}\n", e.what());
+        std::cerr << std::format("Fatal: {}", e.what()) << "\n";
         return EXIT_FAILURE;
     }
 
