@@ -17,15 +17,15 @@
 #include "server/ServerConfig.h"
 #include "server/ServerConfigParser.h"
 
-Result<ServerConfig, std::string> parseArguments(int argc, std::span<char *> argv)
+Result<ServerConfig, std::string> parseArguments(std::span<char *> argv)
 {
     ServerConfig config{};
 
-    for (int i = 1; i < argc; ++i)
+    for (size_t i = 1; i < argv.size(); ++i)
     {
         std::string arg = argv[i];
 
-        if (arg == "--port" && i + 1 < argc)
+        if (arg == "--port" && i + 1 < argv.size())
         {
             auto port = ServerConfigParser::parsePort(argv[++i]);
             if (!port)
@@ -33,7 +33,7 @@ Result<ServerConfig, std::string> parseArguments(int argc, std::span<char *> arg
 
             config.port = port.value();
         }
-        else if (arg == "--max-connections" && i + 1 < argc)
+        else if (arg == "--max-connections" && i + 1 < argv.size())
         {
             auto maxConnections = ServerConfigParser::parseMaxConnections(argv[++i]);
             if (!maxConnections)
@@ -41,7 +41,7 @@ Result<ServerConfig, std::string> parseArguments(int argc, std::span<char *> arg
 
             config.maxConnections = maxConnections.value();
         }
-        else if ((arg == "--backlog" || arg == "--backlog-size") && i + 1 < argc)
+        else if ((arg == "--backlog" || arg == "--backlog-size") && i + 1 < argv.size())
         {
             auto backlog = ServerConfigParser::parseBacklogSize(argv[++i]);
             if (!backlog)
@@ -49,7 +49,7 @@ Result<ServerConfig, std::string> parseArguments(int argc, std::span<char *> arg
 
             config.backlogSize = backlog.value();
         }
-        else if (arg == "--root" && i + 1 < argc)
+        else if (arg == "--root" && i + 1 < argv.size())
         {
             auto rootDirectory = ServerConfigParser::parseRootDirectory(argv[++i]);
 
@@ -60,7 +60,7 @@ Result<ServerConfig, std::string> parseArguments(int argc, std::span<char *> arg
 
             config.rootDirectory = std::move(rootDirectory.value());
         }
-        else if (arg == "--idle-timeout" && i + 1 < argc)
+        else if (arg == "--idle-timeout" && i + 1 < argv.size())
         {
             auto idleTimeout = ServerConfigParser::parseIdleTimeout(argv[++i]);
             if (!idleTimeout)
@@ -104,17 +104,10 @@ int main(int argc, char *argv[])
     {
         network::EpollReactor epollReactor; // might throw (expected if epoll_create1 fails)
         // Exception-free parsing
-        auto configResult = parseArguments(argc, std::span(argv, argc));
+        auto configResult = parseArguments(std::span(argv, argc));
         if (!configResult)
         {
             std::cerr << std::format("Error parsing arguments: {}\n", configResult.error());
-            return EXIT_FAILURE;
-        }
-
-        if (!configResult.value().rootDirectory)
-        {
-            std::cerr << "Error: Root directory not specified. Use --root <root_directory> to specify the root "
-                         "directory.\n";
             return EXIT_FAILURE;
         }
 
