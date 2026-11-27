@@ -32,8 +32,8 @@ finding, and makes CI fail on any new one.
 
 ### Acceptance criteria
 - [x] `scripts/run_clang_tidy.sh build` exits 0 locally (clang-tidy 22.1.8)
-- [ ] The `clang-tidy` CI job is green on the PR (clang-tidy 18.1.3)
-- [ ] A deliberate violation turns the `clang-tidy` job red, then reverted (see Verification)
+- [x] The `clang-tidy` CI job is green on the PR (clang-tidy 18.1.3)
+- [x] A deliberate violation turns the `clang-tidy` job red, then reverted (see Verification)
 - [x] Every disabled check has a comment; no bare `NOLINT` (there are no `NOLINT`s at all)
 - [x] GoogleTest (`build/_deps`) produces no diagnostics
 - [x] 258 tests pass; every `scripts/check_*.sh` passes; build has no warnings
@@ -121,4 +121,10 @@ Local: Fedora, Linux 7.3.3-200.fc44, GCC 16.2.1, clang-tidy 22.1.8. Clean rebuil
 Ubuntu 24.04 container (clang-tidy 18.1.3, `CXX=clang++-18`, CMake 4.3.4), before the core fixes:
 the script ran, exit 1, and reported a strict subset of the clang-tidy 22 findings.
 
-CI: see the PR checks (filled in below once runs complete).
+CI (PR #15, `ubuntu-24.04`, CMake 4.3.4, clang-tidy 18.1.3):
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| [45984674971](https://github.com/guijanson007/cpp_webserver/actions/runs/45984674971) | `a02a74c` docs, all fixes in | green: `build (gcc)`, `build (clang)`, `sanitize`, `clang-tidy` |
+| [45984930294](https://github.com/guijanson007/cpp_webserver/actions/runs/45984930294) | `dbd3bab` deliberate `const std::string copy = words.front();` in `error_test.cpp` | red as intended: only `clang-tidy` failed (`performance-unnecessary-copy-initialization`, exit 1); the other 3 jobs passed |
+| [45985144677](https://github.com/guijanson007/cpp_webserver/actions/runs/45985144677) | `8fd95cf` revert | green: all 4 jobs |
