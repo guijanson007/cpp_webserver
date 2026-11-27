@@ -1,9 +1,7 @@
 #include <cerrno>
 #include <cstring>
 #include <gtest/gtest.h>
-#include <string>
 #include <system_error>
-#include <vector>
 
 #include "common/Error.h"
 
@@ -25,12 +23,4 @@ TEST(Error, IntConstructorIsExplicit)
 {
     static_assert(!std::is_convertible_v<int, Error>, "int must not implicitly convert to Error");
     static_assert(std::is_constructible_v<Error, int>);
-}
-
-// WEB-16: deliberate clang-tidy violation to prove the clang-tidy CI job goes red. Reverted next.
-TEST(CiTidyRedCheck, DeliberateUnnecessaryCopy)
-{
-    const std::vector<std::string> words{"tidy"};
-    const std::string copy = words.front();
-    EXPECT_EQ(copy, "tidy");
 }
