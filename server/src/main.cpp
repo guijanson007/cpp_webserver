@@ -132,7 +132,9 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
 
-        std::cout << std::format("Server is listening on port {}...", server.getPort()) << "\n";
+        // Flush explicitly: stdout is fully buffered when redirected (logs, scripts), and the
+        // reactor loop below never returns, so the startup line would otherwise never appear.
+        std::cout << std::format("Server is listening on port {}...", server.getPort()) << "\n" << std::flush;
         while (true)
         {
             if (!epollReactor.run())
