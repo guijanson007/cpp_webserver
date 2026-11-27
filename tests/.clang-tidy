@@ -1,0 +1,14 @@
+# WEB-16: tests inherit the root configuration and relax only what GoogleTest idioms trip.
+InheritParentConfig: true
+Checks: >
+  -cppcoreguidelines-non-private-member-variables-in-classes,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-special-member-functions
+
+# Why each check is off in tests/:
+#   non-private-member-variables-in-classes  fixtures share state with TEST_F bodies through protected
+#                                            members; that is how GoogleTest fixtures work.
+#   avoid-non-const-global-variables         TEST() expands to static registration objects.
+#   owning-memory                            TEST() expands to `new` of the test class.
+#   special-member-functions                 TEST() classes declare copy operations as deleted only.

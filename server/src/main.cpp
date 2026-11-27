@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <common/FileDescriptor.h>
 #include <fcntl.h>
+#include <filesystem>
 #include <format>
 #include <iostream>
 #include <network/EpollReactor.h>
@@ -16,15 +17,15 @@
 #include "server/ServerConfig.h"
 #include "server/ServerConfigParser.h"
 
-Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
+Result<ServerConfig, std::string> parseArguments(std::span<char *> argv)
 {
     ServerConfig config{};
 
-    for (int i = 1; i < argc; ++i)
+    for (size_t i = 1; i < argv.size(); ++i)
     {
         std::string arg = argv[i];
 
-        if (arg == "--port" && i + 1 < argc)
+        if (arg == "--port" && i + 1 < argv.size())
         {
             auto port = ServerConfigParser::parsePort(argv[++i]);
             if (!port)
@@ -32,7 +33,7 @@ Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
 
             config.port = port.value();
         }
-        else if (arg == "--max-connections" && i + 1 < argc)
+        else if (arg == "--max-connections" && i + 1 < argv.size())
         {
             auto maxConnections = ServerConfigParser::parseMaxConnections(argv[++i]);
             if (!maxConnections)
@@ -40,7 +41,7 @@ Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
 
             config.maxConnections = maxConnections.value();
         }
-        else if ((arg == "--backlog" || arg == "--backlog-size") && i + 1 < argc)
+        else if ((arg == "--backlog" || arg == "--backlog-size") && i + 1 < argv.size())
         {
             auto backlog = ServerConfigParser::parseBacklogSize(argv[++i]);
             if (!backlog)
@@ -48,7 +49,7 @@ Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
 
             config.backlogSize = backlog.value();
         }
-        else if (arg == "--root" && i + 1 < argc)
+        else if (arg == "--root" && i + 1 < argv.size())
         {
             auto rootDirectory = ServerConfigParser::parseRootDirectory(argv[++i]);
 
@@ -56,9 +57,10 @@ Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
             {
                 return std::format("Invalid root directory: {}", rootDirectory.error().message());
             }
+
             config.rootDirectory = std::move(rootDirectory.value());
         }
-        else if (arg == "--idle-timeout" && i + 1 < argc)
+        else if (arg == "--idle-timeout" && i + 1 < argv.size())
         {
             auto idleTimeout = ServerConfigParser::parseIdleTimeout(argv[++i]);
             if (!idleTimeout)
@@ -78,7 +80,7 @@ Result<ServerConfig, std::string> parseArguments(int argc, char *argv[])
     return config;
 }
 
-void registerRoutes(http::Router &router, const ServerConfig &config)
+void registerRoutes(http::Router &router, const std::filesystem::path &rootDirectory)
 {
     router.add(http::HttpMethod::GET, "/", [](const http::Request &)
                { return http::Response(http::StatusCode::Ok, "Hello, World!", "Content-Type: text/plain", false); });
@@ -90,7 +92,7 @@ void registerRoutes(http::Router &router, const ServerConfig &config)
                                          false);
                });
 
-    router.mount("/static/", http::StaticFileHandler(config.rootDirectory.value(), "/static/"));
+    router.mount("/static/", http::StaticFileHandler(rootDirectory, "/static/"));
 }
 
 int main(int argc, char *argv[])
@@ -98,42 +100,53 @@ int main(int argc, char *argv[])
     /* Optimization: Disable synchronization between C and C++ standard streams for performance. */
     std::ios_base::sync_with_stdio(false);
 
-    network::EpollReactor epollReactor; // might throw (expected if epoll_create1 fails)
-
-    // Exception-free parsing
-    auto configResult = parseArguments(argc, argv);
-    if (!configResult)
+    try
     {
-        std::cerr << std::format("Error parsing arguments: {}\n", configResult.error());
-        return EXIT_FAILURE;
-    }
-
-    if (!configResult.value().rootDirectory)
-    {
-        std::cerr
-                << "Error: Root directory not specified. Use --root <root_directory> to specify the root directory.\n";
-        return EXIT_FAILURE;
-    }
-
-    // Configure the router
-    http::Router router;
-    registerRoutes(router, configResult.value());
-
-    Server server(configResult.value(), epollReactor, router);
-
-    if (auto result = server.start(); !result)
-    {
-        std::cerr << std::format("Failed to start server: {}", result.error().message()) << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    std::cout << std::format("Server is listening on port {}...", server.getPort()) << std::endl;
-    while (true)
-    {
-        if (!epollReactor.run())
+        network::EpollReactor epollReactor; // might throw (expected if epoll_create1 fails)
+        // Exception-free parsing
+        auto configResult = parseArguments(std::span(argv, argc));
+        if (!configResult)
         {
-            break;
+            std::cerr << std::format("Error parsing arguments: {}\n", configResult.error());
+            return EXIT_FAILURE;
         }
+
+        // Configure the router
+        const ServerConfig &config = configResult.value();
+
+        if (!config.rootDirectory)
+        {
+            std::cerr << "Error: Root directory not specified. Use --root <root_directory> to specify the root "
+                         "directory.\n";
+            return EXIT_FAILURE;
+        }
+
+        http::Router router;
+        registerRoutes(router, *config.rootDirectory);
+
+        Server server(configResult.value(), epollReactor, std::move(router));
+
+        if (auto result = server.start(); !result)
+        {
+            std::cerr << std::format("Failed to start server: {}", result.error().message()) << "\n";
+            return EXIT_FAILURE;
+        }
+
+        // Flush explicitly: stdout is fully buffered when redirected (logs, scripts), and the
+        // reactor loop below never returns, so the startup line would otherwise never appear.
+        std::cout << std::format("Server is listening on port {}...", server.getPort()) << "\n" << std::flush;
+        while (true)
+        {
+            if (!epollReactor.run())
+            {
+                break;
+            }
+        }
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << std::format("Fatal: {}", e.what()) << "\n";
+        return EXIT_FAILURE;
     }
 
     return EXIT_SUCCESS;

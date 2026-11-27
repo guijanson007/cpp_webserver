@@ -1,12 +1,12 @@
 // Parser.h
 #pragma once
 
-#include <charconv>
 #include <cctype>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
-#include <system_error>
 #include <string_view>
+#include <system_error>
 #include <variant>
 #include "http/Request.h"
 
@@ -121,7 +121,7 @@ namespace http
             return ParseError::BadRequest;
 
         std::string_view method_str = request_line.substr(0, method_end);
-        HttpMethod method;
+        HttpMethod method{};
         if (method_str == "GET")
             method = HttpMethod::GET;
         else if (method_str == "POST")
@@ -175,12 +175,17 @@ namespace http
                 const size_t body_start = cursor;
                 if (buffer.size() - body_start < content_length)
                     return {NeedMore{}};
-                return {Done{Request{.header = raw_headers,
-                                     .body = buffer.substr(body_start, content_length),
-                                     .target = target,
-                                     .version = version,
-                                     .method = method},
-                             body_start + content_length}};
+                return Done{
+                        .request =
+                                Request{
+                                        .header = raw_headers,
+                                        .body = buffer.substr(body_start, content_length),
+                                        .target = target,
+                                        .version = version,
+                                        .method = method,
+                                },
+                        .consumed_bytes = body_start + content_length,
+                };
             }
 
             if (cursor < buffer.size() && buffer[cursor] == '\r' && cursor + 1 == buffer.size())
@@ -253,8 +258,7 @@ namespace http
                     if (!std::isdigit(c))
                         return ParseError::BadRequest;
                 }
-                const auto parsed =
-                        std::from_chars(value.data(), value.data() + value.size(), content_length);
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), content_length);
                 if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size())
                     return ParseError::BadRequest;
             }

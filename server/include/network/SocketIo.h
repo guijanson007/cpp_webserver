@@ -1,20 +1,20 @@
 #pragma once
 
+#include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <string>
-#include <string_view>
 #include <sys/socket.h>
 #include <unistd.h>
-
 #include "common/Result.h"
 
 namespace network
 {
-    enum class ConnectionState
+    enum class ConnectionState : uint8_t
     {
         Open,
-        ClosedByPeer
+        ClosedByPeer,
     };
 
     struct ReadOutcome
@@ -27,23 +27,22 @@ namespace network
     {
     public:
         SocketIo() = default;
-        ~SocketIo() = default;
 
         // Drains the kernel buffer until EAGAIN or EOF.
         // Returns the number of bytes read and whether the peer closed connection.
         // Only returns Error on real OS failures (EBADF, ECONNRESET, etc.).
         static Result<ReadOutcome> readAllAvailable(int fd, std::string &buffer)
         {
-            char tmp[4096];
+            std::array<char, 4096> tmp{};
             size_t total_read = 0;
 
             for (;;)
             {
-                const ssize_t r = ::read(fd, tmp, sizeof(tmp));
+                const ssize_t r = ::read(fd, tmp.data(), tmp.size());
 
                 if (r > 0)
                 {
-                    buffer.append(tmp, static_cast<size_t>(r));
+                    buffer.append(tmp.data(), static_cast<size_t>(r));
                     total_read += static_cast<size_t>(r);
                     continue;
                 }

@@ -37,14 +37,16 @@ public:
     [[nodiscard]] constexpr E &error() & { return std::get<E>(m_data); }
     [[nodiscard]] constexpr E &&error() && { return std::get<E>(std::move(m_data)); }
 
-    [[nodiscard]] constexpr T value_or(const T &default_value) const
+    template<typename U = std::remove_cv_t<T>>
+    [[nodiscard]] constexpr T value_or(U &&default_value) const &
     {
-        return std::holds_alternative<T>(m_data) ? std::get<T>(m_data) : default_value;
+        return ok() ? std::get<T>(m_data) : static_cast<T>(std::forward<U>(default_value));
     }
 
-    [[nodiscard]] constexpr T value_or(T &&default_value) const
+    template<typename U = std::remove_cv_t<T>>
+    [[nodiscard]] constexpr T value_or(U &&default_value) &&
     {
-        return std::holds_alternative<T>(m_data) ? std::get<T>(m_data) : std::move(default_value);
+        return ok() ? std::get<T>(std::move(m_data)) : static_cast<T>(std::forward<U>(default_value));
     }
 
 private:
@@ -62,9 +64,33 @@ public:
 
     [[nodiscard]] explicit constexpr operator bool() const noexcept { return !m_error.has_value(); }
     [[nodiscard]] constexpr bool ok() const noexcept { return !m_error.has_value(); }
-    [[nodiscard]] constexpr const E &error() const & noexcept { return *m_error; }
-    [[nodiscard]] constexpr E &error() & noexcept { return *m_error; }
-    [[nodiscard]] constexpr E &&error() && noexcept { return *std::move(m_error); }
+
+    [[nodiscard]] constexpr const E &error() const &
+    {
+        if (!m_error.has_value())
+        {
+            throw std::bad_optional_access();
+        }
+        return *m_error;
+    }
+
+    [[nodiscard]] constexpr E &error() &
+    {
+        if (!m_error.has_value())
+        {
+            throw std::bad_optional_access();
+        }
+        return *m_error;
+    }
+
+    [[nodiscard]] constexpr E &&error() &&
+    {
+        if (!m_error.has_value())
+        {
+            throw std::bad_optional_access();
+        }
+        return *std::move(m_error);
+    }
 
 private:
     std::optional<E> m_error;

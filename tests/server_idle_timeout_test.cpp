@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <chrono>
@@ -54,7 +55,7 @@ namespace
         return ntohs(addr.sin_port);
     }
 
-    enum class PeerState
+    enum class PeerState : std::uint8_t
     {
         Open,
         Closed
@@ -131,14 +132,14 @@ namespace
         // Reads whatever is available. Closed on EOF or reset.
         static PeerState poll(const FileDescriptor &c, std::string *into = nullptr)
         {
-            char buf[4096];
+            std::array<char, 4096> buf{};
             for (;;)
             {
-                ssize_t n = ::recv(c.get(), buf, sizeof(buf), 0);
+                ssize_t n = ::recv(c.get(), buf.data(), buf.size(), 0);
                 if (n > 0)
                 {
                     if (into)
-                        into->append(buf, static_cast<size_t>(n));
+                        into->append(buf.data(), static_cast<size_t>(n));
                     continue;
                 }
                 if (n == 0)

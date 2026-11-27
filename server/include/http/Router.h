@@ -82,12 +82,12 @@ namespace http
             // std::bad_alloc and other exceptions can be thrown by std::function, std::string, etc.
             catch (const std::exception &e)
             {
-                std::cerr << "Exception during request handling: " << e.what() << std::endl;
+                std::cerr << "Exception during request handling: " << e.what() << "\n";
                 return {StatusCode::InternalServerError, "", "", true};
             }
             catch (...)
             {
-                std::cerr << "Unknown exception during request handling" << std::endl;
+                std::cerr << "Unknown exception during request handling" << "\n";
                 return {StatusCode::InternalServerError, "", "", true};
             }
         }
@@ -113,28 +113,39 @@ namespace http
         {
             const auto method_idx = static_cast<uint8_t>(request.method);
 
-            if (method_idx >= MAX_METHODS || !methods[method_idx])
+            if (method_idx >= MAX_METHODS)
             {
-                if (request.method == HttpMethod::HEAD && methods[static_cast<uint8_t>(HttpMethod::GET)])
+                return {StatusCode::MethodNotAllowed, "", "Allow: GET, HEAD, POST", !request.shouldKeepAlive()};
+            }
+
+            const auto &handler = methods[method_idx];
+
+            if (!handler.has_value())
+            {
+                const auto &getHandler = methods[static_cast<uint8_t>(HttpMethod::GET)];
+                const auto &headHandler = methods[static_cast<uint8_t>(HttpMethod::HEAD)];
+                const auto &postHandler = methods[static_cast<uint8_t>(HttpMethod::POST)];
+
+                if (request.method == HttpMethod::HEAD && getHandler.has_value())
                 {
-                    return methods[static_cast<uint8_t>(HttpMethod::GET)].value()(request);
+                    return getHandler.value()(request);
                 }
 
                 std::string allowHeader = "Allow: ";
                 bool hasPrevious = false;
 
-                if (methods[static_cast<uint8_t>(HttpMethod::GET)])
+                if (getHandler.has_value())
                 {
                     allowHeader += "GET, HEAD";
                     hasPrevious = true;
                 }
-                else if (methods[static_cast<uint8_t>(HttpMethod::HEAD)])
+                else if (headHandler.has_value())
                 {
                     allowHeader += "HEAD";
                     hasPrevious = true;
                 }
 
-                if (methods[static_cast<uint8_t>(HttpMethod::POST)])
+                if (postHandler.has_value())
                 {
                     if (hasPrevious)
                         allowHeader += ", ";
@@ -144,7 +155,7 @@ namespace http
                 return {StatusCode::MethodNotAllowed, "", allowHeader, !request.shouldKeepAlive()};
             }
 
-            return methods[method_idx].value()(request);
+            return handler.value()(request);
         }
 
         std::unordered_map<std::string, std::array<std::optional<HandlerFunc>, MAX_METHODS>, StringViewHash,

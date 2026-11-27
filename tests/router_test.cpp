@@ -28,7 +28,7 @@ namespace
         return "GET " + target + " HTTP/1.1\r\nHost: x\r\n" + extra + "\r\n";
     }
 
-    Response okHandler(const Request &) { return Response(StatusCode::Ok, std::string("hello"), std::string(), false); }
+    Response okHandler(const Request & /*request*/) { return {StatusCode::Ok, std::string("hello"), std::string(), false}; }
 
     Router makeRouter()
     {
@@ -182,7 +182,7 @@ namespace
 {
     Response tagged(std::string tag)
     {
-        return Response(StatusCode::Ok, std::move(tag), std::string(), false);
+        return {StatusCode::Ok, std::move(tag), std::string(), false};
     }
 
     std::string request(const std::string &method, const std::string &target, const std::string &extra = "")

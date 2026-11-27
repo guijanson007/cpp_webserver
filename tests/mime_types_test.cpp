@@ -4,6 +4,7 @@
 //   std::string_view http::mimeTypeForPath(const std::filesystem::path &);
 #include <gtest/gtest.h>
 
+#include <array>
 #include <filesystem>
 #include <string_view>
 #include <utility>
@@ -20,12 +21,12 @@ namespace
 
 TEST(MimeTest, EveryTicketExtensionIsMapped)
 {
-    const std::pair<std::string_view, std::string_view> expected[] = {
+    const auto expected = std::to_array<std::pair<std::string_view, std::string_view>>({
             {".html", "text/html"},       {".css", "text/css"},   {".js", "application/javascript"},
             {".json", "application/json"}, {".txt", "text/plain"}, {".png", "image/png"},
             {".jpg", "image/jpeg"},       {".jpeg", "image/jpeg"}, {".gif", "image/gif"},
             {".svg", "image/svg+xml"},    {".ico", "image/x-icon"},
-    };
+    });
     for (const auto &[ext, mime]: expected)
     {
         EXPECT_EQ(mimeTypeForExtension(ext), mime) << "extension " << ext;
