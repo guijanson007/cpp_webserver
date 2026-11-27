@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <common/FileDescriptor.h>
 #include <fcntl.h>
+#include <filesystem>
 #include <format>
 #include <iostream>
 #include <network/EpollReactor.h>
@@ -79,7 +80,7 @@ Result<ServerConfig, std::string> parseArguments(int argc, std::span<char *> arg
     return config;
 }
 
-void registerRoutes(http::Router &router, const ServerConfig &config)
+void registerRoutes(http::Router &router, const std::filesystem::path &rootDirectory)
 {
     router.add(http::HttpMethod::GET, "/", [](const http::Request &)
                { return http::Response(http::StatusCode::Ok, "Hello, World!", "Content-Type: text/plain", false); });
@@ -91,7 +92,7 @@ void registerRoutes(http::Router &router, const ServerConfig &config)
                                          false);
                });
 
-    router.mount("/static/", http::StaticFileHandler(config.rootDirectory.value(), "/static/"));
+    router.mount("/static/", http::StaticFileHandler(rootDirectory, "/static/"));
 }
 
 int main(int argc, char *argv[])
@@ -118,10 +119,19 @@ int main(int argc, char *argv[])
         }
 
         // Configure the router
-        http::Router router;
-        registerRoutes(router, configResult.value());
+        const ServerConfig &config = configResult.value();
 
-        Server server(configResult.value(), epollReactor, router);
+        if (!config.rootDirectory)
+        {
+            std::cerr << "Error: Root directory not specified. Use --root <root_directory> to specify the root "
+                         "directory.\n";
+            return EXIT_FAILURE;
+        }
+
+        http::Router router;
+        registerRoutes(router, *config.rootDirectory);
+
+        Server server(configResult.value(), epollReactor, std::move(router));
 
         if (auto result = server.start(); !result)
         {
