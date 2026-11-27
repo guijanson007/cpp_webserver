@@ -15,7 +15,8 @@ tested and benchmarked server where every design decision is backed by profiling
 > 500 instead of taking the server down. Idle keep-alive connections are closed after
 > `--idle-timeout` seconds (WEB-13), which completes M3. An opt-in ASan + UBSan build runs every
 > test and check script clean (WEB-14). GitHub Actions builds and tests every push and pull
-> request with GCC, Clang and ASan + UBSan (WEB-15). clang-tidy is next.
+> request with GCC, Clang and ASan + UBSan (WEB-15), and clang-tidy runs with zero findings as a CI
+> job (WEB-16).
 > See [Progress](#progress).
 
 ## Platform and design decisions
@@ -246,6 +247,17 @@ except the `check_write_path.sh` backpressure case, which is too slow under ASan
 cleanups). LeakSanitizer only checks the unit tests: the scripts stop the server with SIGTERM,
 which skips the exit-time leak check until graceful shutdown exists (M6).
 
+Static analysis (WEB-16): clang-tidy reads `.clang-tidy` (repo root) and `tests/.clang-tidy`.
+Every enabled check is an error, and each disabled check has a one-line reason in the file.
+Needs a configured build directory (it reads `compile_commands.json`):
+
+```sh
+scripts/run_clang_tidy.sh build    # exit 0 = no findings
+```
+
+CI uses clang-tidy 18; a recent local clang-tidy (22) reports a superset, so run it before pushing.
+clangd picks up the same configuration in the editor.
+
 Release build:
 
 ```sh
@@ -334,6 +346,7 @@ temporary `--root`.
 | `build (gcc)` | Debug build, all unit tests, `scripts/check_http.sh` |
 | `build (clang)` | Debug build, all unit tests |
 | `sanitize (asan + ubsan, gcc)` | `-DWEBSERVER_SANITIZE=ON` build, all unit tests with `abort_on_error` / `halt_on_error`, so any report fails the job |
+| `clang-tidy` | clang-tidy 18 over every project translation unit (`scripts/run_clang_tidy.sh`), any finding fails the job (WEB-16) |
 
 Not run in CI: `check_scale.sh` (needs `ulimit -n 20000` and 10k sockets), `check_reactor.sh`
 (needs `strace` and ptrace), and `check_write_path.sh` under ASan (known slow backpressure
@@ -353,13 +366,13 @@ Planned: `docs/PERFORMANCE.md`.
 
 ## Progress
 
-### Estimated completion: 85%
+### Estimated completion: 88%
 
 ```
-[#################...]  85%   (40 of 47 required items)
+[##################..]  88%   (42 of 48 required items)
 ```
 
-How it is computed: the checklist below has 47 required items across milestones M1-M5.
+How it is computed: the checklist below has 48 required items across milestones M1-M5.
 Each counts equally. M6 is optional and excluded. This is a rough measure of item count,
 not effort. The HTTP parser and the benchmarking work are likely heavier than the
 average done item, so real progress is probably a bit lower.
@@ -420,7 +433,7 @@ average done item, so real progress is probably a bit lower.
 - [x] `--idle-timeout` flag (0-3600 s, `0` disables, default 60) with `ServerConfigParser::parseIdleTimeout`
 - [x] Idle-timeout end-to-end checks: `check_idle_timeout.sh` (11 checks) and `--idle-timeout` cases in `check_args.sh`
 
-**M4 (partial): Quality foundations**
+**M4 (partial, 14/15): Quality foundations**
 
 - [x] Router unit tests (`RouterTest`, 13 tests plus concept `static_assert`s) (WEB-10)
 - [x] GoogleTest wired in through `FetchContent`
@@ -439,6 +452,11 @@ average done item, so real progress is probably a bit lower.
   Clang (WEB-14)
 - [x] GitHub Actions CI: GCC and Clang builds with unit tests, `check_http.sh`, and an ASan + UBSan
   job (WEB-15)
+- [x] clang-tidy configuration: `.clang-tidy` and `tests/.clang-tidy` (bugprone, performance,
+  modernize, cppcoreguidelines, readability; every disabled check justified), all findings fixed
+  (WEB-16)
+- [x] clang-tidy runner and CI job: `scripts/run_clang_tidy.sh`, `clang-tidy` job, any finding fails
+  CI (WEB-16)
 
 Also done and not counted separately: `Result<T, Error>` error handling with concept
 constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, seven end-to-end check scripts
@@ -447,10 +465,9 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, seven end-to-end c
 
 ### Planned
 
-**M4: Quality (12/14 done, the twelve done items are listed above)**
+**M4: Quality (14/15 done, the fourteen done items are listed above)**
 
 - [ ] Buffer unit tests
-- [ ] clang-tidy configuration
 
 **M5: Polish (0/5)**
 
@@ -491,6 +508,14 @@ constraints, `SocketIo` wrapper layer, `FileDescriptor` RAII, seven end-to-end c
   silenced on GoogleTest's own targets only (WEB-15)
 - [x] `FileReader.h` did not build on glibc < 2.42 (`open_how` and `RESOLVE_*` missing from
   `<fcntl.h>`): includes `<linux/openat2.h>` now (WEB-15, found by the first CI run)
+- [x] `Result<void>::error()` on a success dereferenced an empty `optional` (UB); it throws
+  `std::bad_optional_access` now, like `Result<T>::error()` (WEB-16, found by clang-tidy)
+- [x] An exception from the `EpollReactor` constructor escaped `main`; `main` catches it and exits 1
+  (WEB-16, found by clang-tidy)
+- [x] `Server` and `EpollReactor` could be moved while the reactor held `[this]` handlers; copy and
+  move are deleted now (WEB-16)
+- [x] Unused `client/` removed (it padded every message with NUL bytes to 1028) (WEB-16)
+- [ ] `-Werror` in CI (GCC 13/16 and Clang 18/22 are warning-free)
 
 ### Profiling plan
 
